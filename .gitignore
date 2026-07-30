@@ -1,0 +1,30 @@
+# Datasets (download separately)
+/data/
+*.mat
+*.rar
+*.zip
+*.7z
+
+# Experiment artifacts
+/runs/
+/checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lpan-two-dataset"
+version = "0.1.0"
+description = "Unified LPAN quasi-static and time-varying RIS channel completion baselines and PhyMeta-STGT."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "torch>=2.1",
+  "h5py>=3.8",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+lpan-experiment = "main:main"
+
+[tool.setuptools]
+packages = ["lpan"]
+py-modules = ["main"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
