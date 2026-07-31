@@ -222,6 +222,10 @@ def validate_training_request(
 ) -> None:
     if pretrained and resume:
         raise ValueError("--pretrained and --resume cannot be used together.")
+    if pretrained and model_name != "phymeta_stgt":
+        raise ValueError(
+            "--pretrained transfer is only supported for phymeta_stgt."
+        )
     if adaptation != "full" and model_name != "phymeta_stgt":
         raise ValueError(
             "Non-full adaptation is only supported for phymeta_stgt."
@@ -231,6 +235,57 @@ def validate_training_request(
             "Non-full adaptation requires a pretrained checkpoint. "
             "Use --adaptation full for scratch training."
         )
+
+
+def load_pretrained_checkpoint(
+    model: torch.nn.Module,
+    state: dict[str, object],
+    current_config: dict[str, object],
+    checkpoint: str | Path,
+) -> dict[str, object]:
+    if state.get("model_name") != "phymeta_stgt":
+        raise ValueError(
+            "Transfer learning requires a phymeta_stgt checkpoint, got "
+            f"{state.get('model_name')!r}."
+        )
+    saved_config = state.get("model_config")
+    if not isinstance(saved_config, dict):
+        raise ValueError("Pretrained checkpoint is missing model_config.")
+    architecture_keys = ("hidden", "graph_layers", "heads")
+    mismatches = {
+        key: {
+            "checkpoint": saved_config.get(key),
+            "current": current_config.get(key),
+        }
+        for key in architecture_keys
+        if saved_config.get(key) != current_config.get(key)
+    }
+    if mismatches:
+        raise ValueError(
+            "Pretrained model architecture does not match:\n"
+            + json.dumps(mismatches, indent=2, ensure_ascii=False)
+        )
+    model_state = state.get("model_state")
+    if not isinstance(model_state, dict):
+        raise ValueError("Pretrained checkpoint is missing model_state.")
+    try:
+        model.load_state_dict(model_state, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Pretrained checkpoint weights are incompatible:\n{exc}"
+        ) from exc
+    source_metadata = state.get("metadata")
+    return {
+        "path": str(Path(checkpoint).expanduser().resolve()),
+        "model_name": state["model_name"],
+        "model_config": saved_config,
+        "source_domain": (
+            source_metadata.get("domain")
+            if isinstance(source_metadata, dict)
+            else None
+        ),
+        "strict_load": True,
+    }
 
 
 def train_command(args: argparse.Namespace) -> None:
@@ -280,14 +335,12 @@ def train_command(args: argparse.Namespace) -> None:
     pretrained_metadata = None
     if args.pretrained:
         state = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-        missing, unexpected = model.load_state_dict(
-            state["model_state"], strict=False
+        pretrained_metadata = load_pretrained_checkpoint(
+            model,
+            state,
+            config,
+            args.pretrained,
         )
-        pretrained_metadata = {
-            "path": str(Path(args.pretrained).resolve()),
-            "missing_keys": missing,
-            "unexpected_keys": unexpected,
-        }
     adaptation = configure_adaptation(model, args.adaptation)
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
@@ -548,13 +601,93 @@ def load_checkpoint_model(
     return model, state
 
 
+def resolve_evaluation_semantics(
+    args: argparse.Namespace,
+    state: dict[str, object],
+) -> tuple[str, tuple[int, ...], tuple[int, ...], str]:
+    raw_metadata = state.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+    saved_domain = metadata.get("domain")
+    if saved_domain in {"quasi", "mobility"}:
+        if args.domain is not None and args.domain != saved_domain:
+            raise ValueError(
+                f"Evaluation domain {args.domain!r} does not match checkpoint "
+                f"domain {saved_domain!r}."
+            )
+        domain = args.domain or saved_domain
+    else:
+        domain = args.domain
+    if domain not in {"quasi", "mobility"}:
+        raise ValueError("Specify --domain because checkpoint metadata is missing.")
+
+    mismatches: dict[str, dict[str, object]] = {}
+
+    def resolve(
+        key: str,
+        requested: object,
+        default: object,
+        *,
+        sequence: bool = False,
+    ) -> object:
+        saved = metadata.get(key)
+        normalized_saved = tuple(saved) if sequence and saved is not None else saved
+        normalized_requested = (
+            tuple(requested)
+            if sequence and requested is not None
+            else requested
+        )
+        if (
+            normalized_requested is not None
+            and normalized_saved is not None
+            and normalized_requested != normalized_saved
+        ):
+            mismatches[key] = {
+                "checkpoint": normalized_saved,
+                "evaluation": normalized_requested,
+            }
+        if normalized_requested is not None:
+            return normalized_requested
+        if normalized_saved is not None:
+            return normalized_saved
+        return default
+
+    obs_times = resolve(
+        "obs_time_index",
+        args.obs_times,
+        (0, 1) if domain == "mobility" else (0,),
+        sequence=True,
+    )
+    obs_ris_indices = resolve(
+        "obs_ris_index",
+        args.obs_ris_indices,
+        tuple(range(0, 256, 8)),
+        sequence=True,
+    )
+    complex_layout = resolve(
+        "complex_layout",
+        args.complex_layout,
+        "grouped",
+    )
+    if mismatches and not args.allow_semantic_override:
+        raise ValueError(
+            "Evaluation data semantics do not match checkpoint:\n"
+            + json.dumps(mismatches, indent=2, ensure_ascii=False)
+            + "\nUse --allow-semantic-override only for an intentional override."
+        )
+    return (
+        domain,
+        tuple(obs_times),
+        tuple(obs_ris_indices),
+        str(complex_layout),
+    )
+
+
 def evaluate_command(args: argparse.Namespace) -> None:
     device = device_from(args.device)
     model, state = load_checkpoint_model(args.checkpoint, device)
-    domain = args.domain or state.get("metadata", {}).get("domain")
-    if domain not in {"quasi", "mobility"}:
-        raise ValueError("Specify --domain because checkpoint metadata is missing.")
-    obs_times = args.obs_times if domain == "mobility" else (0,)
+    domain, obs_times, obs_ris_indices, complex_layout = (
+        resolve_evaluation_semantics(args, state)
+    )
     loader = make_loader(
         domain,
         args.split,
@@ -564,8 +697,8 @@ def evaluate_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=args.max_samples,
         obs_times=obs_times,
-        obs_ris_indices=args.obs_ris_indices,
-        complex_layout=args.complex_layout,
+        obs_ris_indices=obs_ris_indices,
+        complex_layout=complex_layout,
     )
     result = evaluate_model(model, loader, device)
     result.update(
@@ -581,8 +714,8 @@ def evaluate_command(args: argparse.Namespace) -> None:
             "data_path": str(loader.dataset.path),
             "parameters": model_parameter_report(model),
             "obs_time_index": list(obs_times),
-            "obs_ris_index": list(args.obs_ris_indices),
-            "complex_layout": args.complex_layout,
+            "obs_ris_index": list(obs_ris_indices),
+            "complex_layout": complex_layout,
         }
     )
     output = Path(args.output)
@@ -925,17 +1058,19 @@ def add_data_root(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_data_semantics(parser: argparse.ArgumentParser) -> None:
+def add_data_semantics(
+    parser: argparse.ArgumentParser, *, optional: bool = False
+) -> None:
     parser.add_argument(
         "--obs-ris-indices",
         type=ints,
-        default=tuple(range(0, 256, 8)),
+        default=None if optional else tuple(range(0, 256, 8)),
         help="32 comma-separated full-grid indices in Yd column order.",
     )
     parser.add_argument(
         "--complex-layout",
         choices=["grouped", "interleaved"],
-        default="grouped",
+        default=None if optional else "grouped",
         help="Raw real/imag channel ordering in Yd and Hd.",
     )
 
@@ -1004,7 +1139,7 @@ def parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--domain", choices=["quasi", "mobility"])
     evaluate.add_argument("--split", choices=["validation", "test"], default="test")
     evaluate.add_argument("--data-path")
-    evaluate.add_argument("--obs-times", type=ints, default=(0, 1))
+    evaluate.add_argument("--obs-times", type=ints)
     evaluate.add_argument("--max-samples", type=int)
     evaluate.add_argument("--per-snr", action="store_true")
     evaluate.add_argument(
@@ -1020,8 +1155,16 @@ def parser() -> argparse.ArgumentParser:
         help="Expected contiguous test samples for each SNR label.",
     )
     evaluate.add_argument("--output", default="runs/evaluation_result.json")
+    evaluate.add_argument(
+        "--allow-semantic-override",
+        action="store_true",
+        help=(
+            "Allow explicitly supplied observation times, RIS indices, or "
+            "complex layout to differ from checkpoint metadata."
+        ),
+    )
     add_data_root(evaluate)
-    add_data_semantics(evaluate)
+    add_data_semantics(evaluate, optional=True)
     add_runtime(evaluate)
     evaluate.set_defaults(func=evaluate_command)
 

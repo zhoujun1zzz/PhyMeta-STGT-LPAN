@@ -24,6 +24,10 @@ LPAN-Compatible PhyMeta-STGT、独立训练、平衡联合训练和准静态到�
 - full、frozen-spatial、adapter-only、selective 四种适配策略；
 - checkpoint、训练历史 CSV、最终 JSON、完整命令和可选按 SNR CSV。
 
+CNN-GRU/GCN-GRU 在编码两个导频块后，从最终上下文递归解码位置 `0..5`，属于
+sequence-to-sequence 全帧重建（包括两个导频位置），不是只从位置 2 开始的严格
+future-only rollout。
+
 ## 导频块位置
 
 时变数据的两个导频块位于六个目标块中的前两个位置，因此零基索引为：
@@ -184,6 +188,9 @@ python main.py train --domain mobility --model phymeta_stgt --mode full \
 - adapter-only：`--adaptation adapter_only`；
 - proposed selective：`--adaptation selective`。
 
+`--pretrained` 只接受结构兼容的 PhyMeta-STGT checkpoint，并使用严格权重键检查；
+传入其他模型、不同 hidden/图层/heads 配置或缺失关键权重都会立即报错。
+
 建议比例为 `0.01/0.05/0.10/0.20/1.0`，每个比例至少 3 个 seed。
 同一 seed 使用一个随机排列的前缀，因此 1% 子集严格包含于 5%，5% 包含于 10%。
 
@@ -198,6 +205,10 @@ python main.py train ... \
 恢复时命令中的模型、数据、比例和主要训练配置必须与原实验一致。
 checkpoint 会保存 Python、NumPy、PyTorch CPU/CUDA 和 DataLoader 随机状态；恢复时
 代码会校验配置、接续原训练历史，并把恢复命令追加到 `resume_commands.log`。
+
+独立 `evaluate` 默认从 checkpoint 继承 domain、导频时间、RIS 映射和复数布局。
+若命令行显式给出的语义与 checkpoint 不同，程序会拒绝运行；只有确实需要跨语义
+测试时才使用 `--allow-semantic-override`。
 
 ## 按 SNR 评估
 

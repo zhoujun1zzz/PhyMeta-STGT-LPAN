@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -33,7 +34,10 @@ from lpan.ridge import RidgeStatistics
 from main import (
     audit_command,
     main as cli_main,
+    load_pretrained_checkpoint,
+    parser as experiment_parser,
     per_snr_evaluation,
+    resolve_evaluation_semantics,
     validate_training_request,
 )
 
@@ -194,6 +198,112 @@ def test_adaptation_guards_and_parameter_freezing() -> None:
     )
     report = configure_adaptation(proposed, "selective")
     assert 0 < report["trainable_parameters"] < report["total_parameters"]
+
+
+def test_pretrained_checkpoint_requires_exact_phymeta_architecture() -> None:
+    source_config = {
+        "domain": "quasi",
+        "hidden": 16,
+        "graph_layers": 1,
+        "heads": 4,
+        "dropout": 0.0,
+    }
+    target_config = {**source_config, "domain": "mobility"}
+    source = build_model("phymeta_stgt", **source_config)
+    state = {
+        "model_name": "phymeta_stgt",
+        "model_config": source_config,
+        "model_state": source.state_dict(),
+        "metadata": {"domain": "quasi"},
+    }
+    target = build_model("phymeta_stgt", **target_config)
+    report = load_pretrained_checkpoint(
+        target, state, target_config, "source.pth"
+    )
+    assert report["strict_load"] is True
+    assert report["source_domain"] == "quasi"
+
+    with pytest.raises(ValueError, match="requires a phymeta_stgt"):
+        load_pretrained_checkpoint(
+            target,
+            {**state, "model_name": "cnn_gru"},
+            target_config,
+            "wrong-model.pth",
+        )
+    with pytest.raises(ValueError, match="architecture does not match"):
+        load_pretrained_checkpoint(
+            target,
+            {
+                **state,
+                "model_config": {**source_config, "heads": 2},
+            },
+            target_config,
+            "wrong-heads.pth",
+        )
+    incomplete_state = dict(source.state_dict())
+    incomplete_state.pop(next(iter(incomplete_state)))
+    with pytest.raises(ValueError, match="weights are incompatible"):
+        load_pretrained_checkpoint(
+            target,
+            {**state, "model_state": incomplete_state},
+            target_config,
+            "missing-key.pth",
+        )
+
+
+def test_evaluation_semantics_inherit_reject_and_override() -> None:
+    saved_indices = tuple(range(1, 256, 8))
+    state = {
+        "metadata": {
+            "domain": "mobility",
+            "obs_time_index": [0, 1],
+            "obs_ris_index": list(saved_indices),
+            "complex_layout": "interleaved",
+        }
+    }
+    defaults = {
+        "domain": None,
+        "obs_times": None,
+        "obs_ris_indices": None,
+        "complex_layout": None,
+        "allow_semantic_override": False,
+    }
+    resolved = resolve_evaluation_semantics(
+        argparse.Namespace(**defaults), state
+    )
+    assert resolved == ("mobility", (0, 1), saved_indices, "interleaved")
+
+    conflicting = argparse.Namespace(**{**defaults, "complex_layout": "grouped"})
+    with pytest.raises(ValueError, match="do not match checkpoint"):
+        resolve_evaluation_semantics(conflicting, state)
+
+    override = argparse.Namespace(
+        **{
+            **defaults,
+            "complex_layout": "grouped",
+            "allow_semantic_override": True,
+        }
+    )
+    assert resolve_evaluation_semantics(override, state)[3] == "grouped"
+
+
+def test_evaluate_cli_semantics_default_to_checkpoint() -> None:
+    args = experiment_parser().parse_args(
+        ["evaluate", "--checkpoint", "model.pth"]
+    )
+    assert args.obs_times is None
+    assert args.obs_ris_indices is None
+    assert args.complex_layout is None
+    assert args.allow_semantic_override is False
+
+
+def test_ci_uses_existing_action_major_versions() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    assert "actions/checkout@v6" in workflow
+    assert "actions/setup-python@v6" in workflow
+    assert "@v7" not in workflow
 
 
 def test_rng_state_round_trip() -> None:
