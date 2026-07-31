@@ -42,6 +42,7 @@ class LPANH5Dataset(Dataset):
         *,
         obs_ris_index: Sequence[int] | None = None,
         obs_time_index: Sequence[int] | None = None,
+        complex_layout: str = "grouped",
         max_samples: int | None = None,
         fraction: float = 1.0,
         subset_seed: int = 123,
@@ -54,6 +55,9 @@ class LPANH5Dataset(Dataset):
         self.domain = domain
         self.split = split
         self.spec = SPECS[domain]
+        if complex_layout not in {"grouped", "interleaved"}:
+            raise ValueError("complex_layout must be grouped or interleaved.")
+        self.complex_layout = complex_layout
         self.obs_ris_index = tuple(
             default_observed_ris_indices()
             if obs_ris_index is None
@@ -96,9 +100,10 @@ class LPANH5Dataset(Dataset):
 
         count = total if max_samples is None else min(total, int(max_samples))
         count = max(1, int(np.floor(count * fraction)))
-        if fraction < 1.0:
+        if fraction < 1.0 or max_samples is not None:
             rng = np.random.default_rng(subset_seed)
-            indices = rng.choice(total, size=count, replace=False)
+            # One seeded permutation makes fractions and max-sample caps nested.
+            indices = rng.permutation(total)[:count]
             self.indices = np.sort(indices).astype(np.int64)
         else:
             self.indices = np.arange(count, dtype=np.int64)
@@ -147,12 +152,16 @@ class LPANH5Dataset(Dataset):
         return len(self.indices)
 
     @staticmethod
-    def _grouped_to_complex_last(
-        array: np.ndarray, blocks: int
+    def _to_complex_last(
+        array: np.ndarray, blocks: int, layout: str
     ) -> np.ndarray:
-        # Raw sample: [2*T, RIS, BS], grouped [real(T), imag(T)].
-        real = array[:blocks]
-        imag = array[blocks : 2 * blocks]
+        # Raw sample: [2*T, RIS, BS].
+        if layout == "grouped":
+            real = array[:blocks]
+            imag = array[blocks : 2 * blocks]
+        else:
+            real = array[0 : 2 * blocks : 2]
+            imag = array[1 : 2 * blocks : 2]
         return np.stack((real, imag), axis=-1).transpose(0, 1, 2, 3)
 
     def __getitem__(self, item: int) -> dict[str, torch.Tensor]:
@@ -163,8 +172,12 @@ class LPANH5Dataset(Dataset):
         h = np.asarray(self._target[:, :, :, index], dtype=np.float32)
         # [T, P/N, M, 2] is already obtained because raw axes are
         # [channel, RIS, BS]. No speculative row/column remapping is applied.
-        obs = self._grouped_to_complex_last(y, self.spec.obs_blocks)
-        target = self._grouped_to_complex_last(h, self.spec.query_blocks)
+        obs = self._to_complex_last(
+            y, self.spec.obs_blocks, self.complex_layout
+        )
+        target = self._to_complex_last(
+            h, self.spec.query_blocks, self.complex_layout
+        )
         return {
             "obs_h": torch.from_numpy(np.ascontiguousarray(obs)),
             "target_h": torch.from_numpy(np.ascontiguousarray(target)),

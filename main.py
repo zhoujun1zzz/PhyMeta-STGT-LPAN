@@ -3,21 +3,26 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import random
 import shlex
 import sys
 import time
 from pathlib import Path
 
 import h5py
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from lpan.data import LPANH5Dataset
 from lpan.engine import (
+    capture_rng_state,
     configure_adaptation,
     evaluate_model,
     move_batch,
     nmse_db_from_result,
+    read_history,
+    restore_rng_state,
     save_checkpoint,
     train_balanced_joint_epoch,
     train_epoch,
@@ -70,6 +75,8 @@ def make_loader(
     fraction: float = 1.0,
     seed: int = 123,
     obs_times: tuple[int, ...] | None = None,
+    obs_ris_indices: tuple[int, ...] | None = None,
+    complex_layout: str = "grouped",
     shuffle: bool = False,
 ) -> DataLoader:
     dataset = LPANH5Dataset(
@@ -80,6 +87,8 @@ def make_loader(
         fraction=fraction,
         subset_seed=seed,
         obs_time_index=obs_times,
+        obs_ris_index=obs_ris_indices,
+        complex_layout=complex_layout,
     )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
@@ -138,8 +147,8 @@ def audit_command(args: argparse.Namespace) -> None:
             },
         },
         "assumptions": {
-            "complex_layout": "grouped real blocks followed by imaginary blocks",
-            "obs_ris_index": list(range(0, 256, 8)),
+            "complex_layout": args.complex_layout,
+            "obs_ris_index": list(args.obs_ris_indices),
             "mobility_obs_time_index": list(args.mobility_obs_times),
             "pilot_time_note": (
                 "The task definition confirms that the two pilot blocks are "
@@ -160,29 +169,44 @@ def audit_command(args: argparse.Namespace) -> None:
                 "split": split,
                 "path": str(path),
                 "exists": path.is_file(),
+                "valid": False,
                 "attempted_paths": [str(candidate) for candidate in candidates],
             }
             if path.is_file():
-                with h5py.File(path, "r") as handle:
-                    entry["keys"] = sorted(handle.keys())
-                    entry["datasets"] = {
-                        key: {
-                            "shape": list(handle[key].shape),
-                            "dtype": str(handle[key].dtype),
+                try:
+                    if not h5py.is_hdf5(path):
+                        raise ValueError("Not an HDF5/MATLAB v7.3 file")
+                    with h5py.File(path, "r") as handle:
+                        entry["keys"] = sorted(handle.keys())
+                        entry["datasets"] = {
+                            key: {
+                                "shape": list(handle[key].shape),
+                                "dtype": str(handle[key].dtype),
+                            }
+                            for key in handle.keys()
+                            if isinstance(handle[key], h5py.Dataset)
                         }
-                        for key in handle.keys()
-                        if isinstance(handle[key], h5py.Dataset)
+                    obs_times = (
+                        args.mobility_obs_times if domain == "mobility" else (0,)
+                    )
+                    dataset = LPANH5Dataset(
+                        path,
+                        domain,
+                        split,
+                        max_samples=1,
+                        obs_time_index=obs_times,
+                        obs_ris_index=args.obs_ris_indices,
+                        complex_layout=args.complex_layout,
+                    )
+                    sample = dataset[0]
+                    entry["unified_sample_shapes"] = {
+                        key: list(value.shape)
+                        for key, value in sample.items()
+                        if key in {"obs_h", "target_h", "observation_mask"}
                     }
-                obs_times = args.mobility_obs_times if domain == "mobility" else (0,)
-                dataset = LPANH5Dataset(
-                    path, domain, split, max_samples=1, obs_time_index=obs_times
-                )
-                sample = dataset[0]
-                entry["unified_sample_shapes"] = {
-                    key: list(value.shape)
-                    for key, value in sample.items()
-                    if key in {"obs_h", "target_h", "observation_mask"}
-                }
+                    entry["valid"] = True
+                except Exception as exc:
+                    entry["error"] = f"{type(exc).__name__}: {exc}"
             report["files"].append(entry)
     output = Path(args.output)
     write_json(output, report)
@@ -190,7 +214,30 @@ def audit_command(args: argparse.Namespace) -> None:
     print(f"Audit written to {output}")
 
 
+def validate_training_request(
+    model_name: str,
+    adaptation: str,
+    pretrained: str | None,
+    resume: str | None,
+) -> None:
+    if pretrained and resume:
+        raise ValueError("--pretrained and --resume cannot be used together.")
+    if adaptation != "full" and model_name != "phymeta_stgt":
+        raise ValueError(
+            "Non-full adaptation is only supported for phymeta_stgt."
+        )
+    if not pretrained and not resume and adaptation != "full":
+        raise ValueError(
+            "Non-full adaptation requires a pretrained checkpoint. "
+            "Use --adaptation full for scratch training."
+        )
+
+
 def train_command(args: argparse.Namespace) -> None:
+    validate_training_request(
+        args.model, args.adaptation, args.pretrained, args.resume
+    )
+
     domain = args.domain
     obs_times = args.obs_times if domain == "mobility" else (0,)
     smoke = args.mode == "smoke"
@@ -208,6 +255,8 @@ def train_command(args: argparse.Namespace) -> None:
         fraction=args.fraction,
         seed=args.seed,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
         shuffle=True,
     )
     val_loader = make_loader(
@@ -220,6 +269,8 @@ def train_command(args: argparse.Namespace) -> None:
         max_samples=max_val,
         seed=args.seed,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     config = model_config(args, domain)
     model = build_model(args.model, **config)
@@ -243,17 +294,18 @@ def train_command(args: argparse.Namespace) -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    start_epoch, best_nmse = 1, float("inf")
-    if args.resume:
-        state = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(state["model_state"])
-        optimizer.load_state_dict(state["optimizer_state"])
-        start_epoch = int(state["epoch"]) + 1
-        best_nmse = float(state["best_nmse"])
-
     stamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"{domain}_{args.model}_{args.mode}_{stamp}"
-    run_dir = Path(args.output_root) / run_name
+    run_dir = (
+        Path(args.resume).expanduser().resolve().parent.parent
+        if args.resume
+        else Path(args.output_root) / run_name
+    )
+    if args.resume and args.run_name and run_dir.name != args.run_name:
+        raise ValueError(
+            f"--run-name {args.run_name!r} does not match resumed run "
+            f"directory {run_dir.name!r}."
+        )
     if run_dir.exists() and not args.resume:
         raise FileExistsError(
             f"Run directory already exists; choose another --run-name: {run_dir}"
@@ -262,9 +314,9 @@ def train_command(args: argparse.Namespace) -> None:
     results = run_dir / "results"
     checkpoints.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
-    (run_dir / "command.txt").write_text(
-        shlex.join(sys.argv), encoding="utf-8"
-    )
+    command = shlex.join(sys.argv)
+    if not args.resume:
+        (run_dir / "command.txt").write_text(command, encoding="utf-8")
 
     weights = LossWeights(
         args.nmse_weight,
@@ -272,20 +324,152 @@ def train_command(args: argparse.Namespace) -> None:
         args.obs_weight,
         args.delta_weight if domain == "mobility" else 0.0,
     )
-    history: list[dict[str, object]] = []
     metadata = {
         "domain": domain,
         "mode": args.mode,
         "seed": args.seed,
         "obs_time_index": list(obs_times),
-        "obs_ris_index": list(range(0, 256, 8)),
+        "obs_ris_index": list(args.obs_ris_indices),
+        "complex_layout": args.complex_layout,
         "train_fraction": args.fraction,
         "adaptation": args.adaptation,
         "adaptation_parameters": adaptation,
         "pretrained": pretrained_metadata,
         "train_path": str(train_loader.dataset.path),
         "validation_path": str(val_loader.dataset.path),
+        "max_train": max_train,
+        "max_validation": max_val,
+        "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "workers": args.workers,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "grad_clip": args.grad_clip,
+        "loss_weights": {
+            "nmse": weights.nmse,
+            "charbonnier": weights.charbonnier,
+            "observation": weights.observation,
+            "delta": weights.delta,
+        },
     }
+    start_epoch, best_nmse = 1, float("inf")
+    history: list[dict[str, object]] = []
+    if args.resume:
+        state = torch.load(args.resume, map_location=device, weights_only=False)
+        saved_metadata = state.get("metadata", {})
+        checks = {
+            "model_name": (state.get("model_name"), args.model),
+            "model_config": (state.get("model_config"), config),
+            "domain": (saved_metadata.get("domain"), metadata["domain"]),
+            "mode": (saved_metadata.get("mode"), metadata["mode"]),
+            "seed": (saved_metadata.get("seed"), metadata["seed"]),
+            "obs_time_index": (
+                saved_metadata.get("obs_time_index"),
+                metadata["obs_time_index"],
+            ),
+            "obs_ris_index": (
+                saved_metadata.get("obs_ris_index"),
+                metadata["obs_ris_index"],
+            ),
+            "complex_layout": (
+                saved_metadata.get("complex_layout"),
+                metadata["complex_layout"],
+            ),
+            "train_fraction": (
+                saved_metadata.get("train_fraction"),
+                metadata["train_fraction"],
+            ),
+            "adaptation": (
+                saved_metadata.get("adaptation"),
+                metadata["adaptation"],
+            ),
+            "train_path": (
+                saved_metadata.get("train_path"),
+                metadata["train_path"],
+            ),
+            "validation_path": (
+                saved_metadata.get("validation_path"),
+                metadata["validation_path"],
+            ),
+            "max_train": (
+                saved_metadata.get("max_train"),
+                metadata["max_train"],
+            ),
+            "max_validation": (
+                saved_metadata.get("max_validation"),
+                metadata["max_validation"],
+            ),
+            "batch_size": (
+                saved_metadata.get("batch_size"),
+                metadata["batch_size"],
+            ),
+            "eval_batch_size": (
+                saved_metadata.get("eval_batch_size"),
+                metadata["eval_batch_size"],
+            ),
+            "workers": (
+                saved_metadata.get("workers"),
+                metadata["workers"],
+            ),
+            "learning_rate": (
+                saved_metadata.get("learning_rate"),
+                metadata["learning_rate"],
+            ),
+            "weight_decay": (
+                saved_metadata.get("weight_decay"),
+                metadata["weight_decay"],
+            ),
+            "grad_clip": (
+                saved_metadata.get("grad_clip"),
+                metadata["grad_clip"],
+            ),
+            "loss_weights": (
+                saved_metadata.get("loss_weights"),
+                metadata["loss_weights"],
+            ),
+        }
+        mismatches = {
+            key: {"checkpoint": saved, "current": current}
+            for key, (saved, current) in checks.items()
+            if saved != current
+        }
+        if mismatches:
+            raise ValueError(
+                "Resume configuration does not match checkpoint:\n"
+                + json.dumps(mismatches, indent=2, ensure_ascii=False)
+            )
+        if state.get("rng_state") is None:
+            raise ValueError(
+                "Checkpoint predates strict RNG-state saving and cannot be "
+                "resumed reproducibly."
+            )
+        model.load_state_dict(state["model_state"])
+        optimizer.load_state_dict(state["optimizer_state"])
+        start_epoch = int(state["epoch"]) + 1
+        if epochs < start_epoch:
+            raise ValueError(
+                f"--epochs must be at least {start_epoch} when resuming "
+                f"checkpoint epoch {state['epoch']}."
+            )
+        best_nmse = float(state["best_nmse"])
+        history = read_history(results / "training_history.csv")
+        if not history or int(history[-1]["epoch"]) != int(state["epoch"]):
+            raise ValueError(
+                "training_history.csv is missing or out of sync with checkpoint."
+            )
+        restore_rng_state(
+            state["rng_state"],
+            {
+                "train": train_loader.generator,
+                "validation": val_loader.generator,
+            },
+        )
+        metadata = saved_metadata
+        with (run_dir / "resume_commands.log").open(
+            "a", encoding="utf-8"
+        ) as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {command}\n")
+
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
         train_result = train_epoch(
@@ -307,6 +491,13 @@ def train_command(args: argparse.Namespace) -> None:
             "epoch_seconds": time.perf_counter() - started,
         }
         history.append(row)
+        write_history(results / "training_history.csv", history)
+        rng_state = capture_rng_state(
+            {
+                "train": train_loader.generator,
+                "validation": val_loader.generator,
+            }
+        )
         save_checkpoint(
             checkpoints / "last_checkpoint.pth",
             model,
@@ -316,6 +507,7 @@ def train_command(args: argparse.Namespace) -> None:
             model_name=args.model,
             model_config=config,
             metadata=metadata,
+            rng_state=rng_state,
         )
         if val_nmse < best_nmse:
             best_nmse = val_nmse
@@ -328,8 +520,8 @@ def train_command(args: argparse.Namespace) -> None:
                 model_name=args.model,
                 model_config=config,
                 metadata=metadata,
+                rng_state=rng_state,
             )
-        write_history(results / "training_history.csv", history)
         print(
             f"epoch={epoch} train={train_result['total']:.6g} "
             f"val={row['validation_nmse_db']:.4f} dB"
@@ -372,6 +564,8 @@ def evaluate_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=args.max_samples,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     result = evaluate_model(model, loader, device)
     result.update(
@@ -387,6 +581,8 @@ def evaluate_command(args: argparse.Namespace) -> None:
             "data_path": str(loader.dataset.path),
             "parameters": model_parameter_report(model),
             "obs_time_index": list(obs_times),
+            "obs_ris_index": list(args.obs_ris_indices),
+            "complex_layout": args.complex_layout,
         }
     )
     output = Path(args.output)
@@ -394,7 +590,14 @@ def evaluate_command(args: argparse.Namespace) -> None:
     if args.per_snr:
         if domain != "mobility" or args.split != "test":
             raise ValueError("--per-snr is only defined for the mobility test split.")
-        per_snr_evaluation(model, loader, device, output.with_suffix(".per_snr.csv"))
+        per_snr_evaluation(
+            model,
+            loader,
+            device,
+            output.with_suffix(".per_snr.csv"),
+            args.snr_values,
+            args.samples_per_snr,
+        )
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
@@ -403,18 +606,40 @@ def per_snr_evaluation(
     loader: DataLoader,
     device: torch.device,
     output: Path,
+    snr_values: tuple[int, ...],
+    samples_per_snr: int,
 ) -> None:
-    accumulators = {snr: MetricAccumulator() for snr in range(-10, 31, 5)}
+    if not snr_values or len(set(snr_values)) != len(snr_values):
+        raise ValueError("--snr-values must contain unique values.")
+    if samples_per_snr <= 0:
+        raise ValueError("--samples-per-snr must be positive.")
+    expected = len(snr_values) * samples_per_snr
+    if len(loader.dataset) != expected:
+        raise ValueError(
+            f"Per-SNR evaluation expects {len(snr_values)} x "
+            f"{samples_per_snr} = {expected} samples, but the loader has "
+            f"{len(loader.dataset)}. Verify dataset ordering and grouping."
+        )
+    dataset_indices = getattr(loader.dataset, "indices", None)
+    if dataset_indices is not None and not np.array_equal(
+        np.asarray(dataset_indices), np.arange(expected)
+    ):
+        raise ValueError(
+            "Per-SNR evaluation requires the complete, original sample order. "
+            "Do not combine --per-snr with fraction or a truncating "
+            "--max-samples setting."
+        )
+    accumulators = {snr: MetricAccumulator() for snr in snr_values}
     model.eval()
     with torch.inference_mode():
         for cpu_batch in loader:
             batch = move_batch(cpu_batch, device)
             prediction = model(batch)
-            groups = batch["sample_index"] // 1000
+            groups = batch["sample_index"] // samples_per_snr
             for group in torch.unique(groups):
                 selected = torch.where(groups == group)[0]
                 group_int = int(group)
-                if 0 <= group_int <= 8:
+                if 0 <= group_int < len(snr_values):
                     sub_batch = {
                         key: (
                             value.index_select(0, selected)
@@ -423,7 +648,7 @@ def per_snr_evaluation(
                         )
                         for key, value in batch.items()
                     }
-                    accumulators[-10 + 5 * group_int].update(
+                    accumulators[snr_values[group_int]].update(
                         prediction.index_select(0, selected), sub_batch
                     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -453,6 +678,8 @@ def interpolation_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=args.max_samples,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     metrics = MetricAccumulator()
     for batch in loader:
@@ -469,6 +696,8 @@ def interpolation_command(args: argparse.Namespace) -> None:
             "spatial": args.spatial,
             "temporal": args.temporal,
             "obs_time_index": list(obs_times),
+            "obs_ris_index": list(args.obs_ris_indices),
+            "complex_layout": args.complex_layout,
         }
     )
     write_json(Path(args.output), result)
@@ -486,6 +715,8 @@ def ridge_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=args.max_train,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     val_loader = make_loader(
         args.domain,
@@ -496,6 +727,8 @@ def ridge_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=args.max_val,
         obs_times=obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     statistics = RidgeStatistics.accumulate(train_loader)
     candidates = []
@@ -529,6 +762,8 @@ def ridge_command(args: argparse.Namespace) -> None:
             workers=args.workers,
             max_samples=args.max_test,
             obs_times=obs_times,
+            obs_ris_indices=args.obs_ris_indices,
+            complex_layout=args.complex_layout,
         )
         report["independent_test"] = best_model.evaluate(test_loader)
     write_json(output, report)
@@ -553,6 +788,8 @@ def joint_command(args: argparse.Namespace) -> None:
         max_samples=max_train,
         shuffle=True,
         seed=args.seed,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     mobility_train = make_loader(
         "mobility",
@@ -564,6 +801,8 @@ def joint_command(args: argparse.Namespace) -> None:
         shuffle=True,
         seed=args.seed,
         obs_times=args.obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     quasi_val = make_loader(
         "quasi",
@@ -572,6 +811,8 @@ def joint_command(args: argparse.Namespace) -> None:
         batch_size=args.eval_batch_size,
         workers=args.workers,
         max_samples=max_val,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     mobility_val = make_loader(
         "mobility",
@@ -581,6 +822,8 @@ def joint_command(args: argparse.Namespace) -> None:
         workers=args.workers,
         max_samples=max_val,
         obs_times=args.obs_times,
+        obs_ris_indices=args.obs_ris_indices,
+        complex_layout=args.complex_layout,
     )
     run_name = args.run_name or f"joint_phymeta_stgt_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.output_root) / run_name
@@ -597,6 +840,8 @@ def joint_command(args: argparse.Namespace) -> None:
         "domain": "joint",
         "sampling": "balanced alternating homogeneous task batches",
         "mobility_obs_time_index": list(args.obs_times),
+        "obs_ris_index": list(args.obs_ris_indices),
+        "complex_layout": args.complex_layout,
         "seed": args.seed,
     }
     for epoch in range(1, epochs + 1):
@@ -680,6 +925,21 @@ def add_data_root(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_data_semantics(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--obs-ris-indices",
+        type=ints,
+        default=tuple(range(0, 256, 8)),
+        help="32 comma-separated full-grid indices in Yd column order.",
+    )
+    parser.add_argument(
+        "--complex-layout",
+        choices=["grouped", "interleaved"],
+        default="grouped",
+        help="Raw real/imag channel ordering in Yd and Hd.",
+    )
+
+
 def add_model(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--graph-layers", type=int, default=2)
@@ -697,6 +957,7 @@ def parser() -> argparse.ArgumentParser:
     audit.add_argument("--mobility-obs-times", type=ints, default=(0, 1))
     audit.add_argument("--output", default="runs/data_audit.json")
     add_data_root(audit)
+    add_data_semantics(audit)
     audit.set_defaults(func=audit_command)
 
     train = commands.add_parser("train")
@@ -733,6 +994,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--run-name")
     train.add_argument("--output-root", default="runs")
     add_data_root(train)
+    add_data_semantics(train)
     add_runtime(train)
     add_model(train)
     train.set_defaults(func=train_command)
@@ -745,8 +1007,21 @@ def parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--obs-times", type=ints, default=(0, 1))
     evaluate.add_argument("--max-samples", type=int)
     evaluate.add_argument("--per-snr", action="store_true")
+    evaluate.add_argument(
+        "--snr-values",
+        type=ints,
+        default=tuple(range(-10, 31, 5)),
+        help="Comma-separated SNR labels in test-file order.",
+    )
+    evaluate.add_argument(
+        "--samples-per-snr",
+        type=int,
+        default=1000,
+        help="Expected contiguous test samples for each SNR label.",
+    )
     evaluate.add_argument("--output", default="runs/evaluation_result.json")
     add_data_root(evaluate)
+    add_data_semantics(evaluate)
     add_runtime(evaluate)
     evaluate.set_defaults(func=evaluate_command)
 
@@ -762,6 +1037,7 @@ def parser() -> argparse.ArgumentParser:
     interpolation.add_argument("--workers", type=int, default=0)
     interpolation.add_argument("--batch-size", type=int, default=8)
     add_data_root(interpolation)
+    add_data_semantics(interpolation)
     interpolation.set_defaults(func=interpolation_command)
 
     ridge = commands.add_parser("ridge")
@@ -779,6 +1055,7 @@ def parser() -> argparse.ArgumentParser:
     ridge.add_argument("--workers", type=int, default=0)
     ridge.add_argument("--batch-size", type=int, default=2)
     add_data_root(ridge)
+    add_data_semantics(ridge)
     ridge.set_defaults(func=ridge_command)
 
     joint = commands.add_parser("joint")
@@ -793,6 +1070,7 @@ def parser() -> argparse.ArgumentParser:
     joint.add_argument("--run-name")
     joint.add_argument("--output-root", default="runs")
     add_data_root(joint)
+    add_data_semantics(joint)
     add_runtime(joint)
     add_model(joint)
     joint.set_defaults(func=joint_command)
@@ -801,9 +1079,12 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
-    torch.manual_seed(getattr(args, "seed", 123))
+    seed = getattr(args, "seed", 123)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(getattr(args, "seed", 123))
+        torch.cuda.manual_seed_all(seed)
     args.func(args)
 
 

@@ -63,6 +63,16 @@ def spatial_interpolation_weights(
     return weights
 
 
+def expand_observations_to_grid(
+    batch: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Place sparse RIS observations on their physical 256-node coordinate grid."""
+    obs = batch["obs_h"]
+    obs_index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
+    weights = spatial_interpolation_weights(obs_index).to(obs.dtype)
+    return torch.einsum("np,btpmc->btnmc", weights, obs)
+
+
 @torch.no_grad()
 def interpolation_baseline(
     batch: Mapping[str, torch.Tensor],
@@ -74,10 +84,11 @@ def interpolation_baseline(
     obs_index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
     obs_time = _shared_vector(batch["obs_time_index"]).to(obs.device)
     query_time = _shared_vector(batch["query_time"]).to(obs.device)
-    sw = spatial_interpolation_weights(
-        obs_index, nearest=(spatial == "nearest")
-    ).to(obs.dtype)
-    spatial_full = torch.einsum("np,btpmc->btnmc", sw, obs)
+    if spatial == "linear":
+        spatial_full = expand_observations_to_grid(batch)
+    else:
+        sw = spatial_interpolation_weights(obs_index, nearest=True).to(obs.dtype)
+        spatial_full = torch.einsum("np,btpmc->btnmc", sw, obs)
     if temporal == "nearest":
         distances = torch.abs(
             query_time[:, None].float() - obs_time[None, :].float()
@@ -113,10 +124,9 @@ class EDSRLite(nn.Module):
         self.tail = nn.Conv2d(hidden, 2 * query_blocks, 3, padding=1)
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        obs = batch["obs_h"]
-        b, t, _, m, _ = obs.shape
-        x = obs.permute(0, 1, 4, 3, 2).reshape(b, 2 * t, m, -1)
-        x = F.interpolate(x, size=(m, 256), mode="bilinear", align_corners=False)
+        full = expand_observations_to_grid(batch)
+        b, t, _, m, _ = full.shape
+        x = full.permute(0, 1, 4, 3, 2).reshape(b, 2 * t, m, 256)
         x = self.tail(self.body(self.head(x)))
         x = x.reshape(b, self.query_blocks, 2, m, 256)
         return x.permute(0, 1, 4, 3, 2).contiguous()
@@ -186,20 +196,18 @@ class CNNGRU(nn.Module):
             ResidualBlock(hidden),
         )
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
+        self.time_decoder = AutoregressiveTimeDecoder(hidden)
         self.head = nn.Linear(hidden, 2)
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        obs = batch["obs_h"]
-        b, t, _, m, _ = obs.shape
-        x = obs.permute(0, 1, 4, 3, 2).reshape(b * t, 2, m, -1)
-        x = F.interpolate(x, size=(m, 256), mode="bilinear", align_corners=False)
+        full = expand_observations_to_grid(batch)
+        b, t, _, m, _ = full.shape
+        x = full.permute(0, 1, 4, 3, 2).reshape(b * t, 2, m, 256)
         x = self.encoder(x).reshape(b, t, self.hidden, m, 256)
         x = x.permute(0, 3, 4, 1, 2).reshape(b * m * 256, t, self.hidden)
-        x, _ = self.gru(x)
-        obs_time = _shared_vector(batch["obs_time_index"]).to(x.device)
+        _, hidden = self.gru(x)
         query_time = _shared_vector(batch["query_time"]).to(x.device)
-        weights = linear_query_weights(obs_time, query_time).to(x.dtype)
-        x = torch.einsum("qt,bth->bqh", weights, x)
+        x = self.time_decoder(hidden[-1], query_time)
         q = x.shape[1]
         x = self.head(x).reshape(b, m, 256, q, 2)
         return x.permute(0, 3, 2, 1, 4).contiguous()
@@ -209,19 +217,47 @@ class GCNGRU(SpatialGCN):
     def __init__(self, hidden: int = 64, layers: int = 3) -> None:
         super().__init__(hidden, layers)
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
+        self.time_decoder = AutoregressiveTimeDecoder(hidden)
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         x = self.encode(batch)
         b, t, n, h = x.shape
         x = x.permute(0, 2, 1, 3).reshape(b * n, t, h)
-        x, _ = self.gru(x)
-        obs_time = _shared_vector(batch["obs_time_index"]).to(x.device)
+        _, hidden = self.gru(x)
         query_time = _shared_vector(batch["query_time"]).to(x.device)
-        weights = linear_query_weights(obs_time, query_time).to(x.dtype)
-        x = torch.einsum("qt,bth->bqh", weights, x)
+        x = self.time_decoder(hidden[-1], query_time)
         q = x.shape[1]
         x = self.output(x).reshape(b, n, q, 64, 2)
         return x.permute(0, 2, 1, 3, 4).contiguous()
+
+
+class AutoregressiveTimeDecoder(nn.Module):
+    """Generate distinct target-block states from an encoded observation history."""
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.time_encoder = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.cell = nn.GRUCell(hidden, hidden)
+
+    def forward(
+        self, context: torch.Tensor, query_time: torch.Tensor
+    ) -> torch.Tensor:
+        if query_time.numel() > 1 and not torch.all(query_time[1:] >= query_time[:-1]):
+            raise ValueError("query_time must be non-decreasing.")
+        scale = max(1, int(query_time.max().item()))
+        time_features = self.time_encoder(
+            (query_time.to(context).reshape(-1, 1) / scale)
+        )
+        hidden = context
+        outputs = []
+        for feature in time_features:
+            hidden = self.cell(feature.expand_as(hidden), hidden)
+            outputs.append(hidden)
+        return torch.stack(outputs, dim=1)
 
 
 class SparseGraphAttention(nn.Module):

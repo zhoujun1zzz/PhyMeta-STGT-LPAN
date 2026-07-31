@@ -15,6 +15,8 @@ LPAN-Compatible PhyMeta-STGT、独立训练、平衡联合训练和准静态到�
 - LS coarse input + nearest/linear 空间与时间插值；
 - Empirical Ridge，正则系数只用验证集选择；
 - EDSR-lite、Spatial GCN、CNN-GRU、GCN-GRU；
+- CNN-GRU/GCN-GRU 使用自回归 GRU 时间解码器生成 6 个不同目标块；
+- Spatial GCN 故意保留线性插值/末端保持的时间策略，作为纯空间消融；
 - PhyMeta-STGT：observed-to-all cross-attention、四邻域稀疏图注意力、
   可变长度时间查询、domain FiLM adapter、逐 RIS 节点解码；
 - 样本级复数 NMSE、Charbonnier、粗信道观测一致性、时间变化匹配损失；
@@ -31,8 +33,16 @@ LPAN-Compatible PhyMeta-STGT、独立训练、平衡联合训练和准静态到�
 ```
 
 这是所有命令的默认值；一般无需重复传入。参数仍保留，便于后续处理其他数据设置。
-32 个 RIS 观测列默认映射到 `0,8,...,248`。可先运行审计并进一步用权威生成
-设置确认 UPA flatten 规则。
+32 个 RIS 观测列默认映射到 `0,8,...,248`，复数通道默认采用 grouped 排列。
+两项均可显式覆盖：
+
+```bash
+--obs-ris-indices 0,8,16,...,248
+--complex-layout grouped  # 或 interleaved
+```
+
+MAT 文件本身不包含 RIS 物理索引或 UPA flatten 元数据。正式实验仍应以权威数据
+生成设置确认这些语义；`audit` 只报告当前配置和可检查的证据，不会把假设标成事实。
 
 ## 快速开始
 
@@ -168,13 +178,14 @@ python main.py train --domain mobility --model phymeta_stgt --mode full \
 
 对应对照只需改变：
 
-- scratch：去掉 `--pretrained`；
+- scratch：去掉 `--pretrained`，并使用 `--adaptation full`；
 - full fine-tuning：`--adaptation full`；
 - frozen spatial：`--adaptation frozen_spatial`；
 - adapter-only：`--adaptation adapter_only`；
 - proposed selective：`--adaptation selective`。
 
 建议比例为 `0.01/0.05/0.10/0.20/1.0`，每个比例至少 3 个 seed。
+同一 seed 使用一个随机排列的前缀，因此 1% 子集严格包含于 5%，5% 包含于 10%。
 
 ## 恢复训练
 
@@ -185,12 +196,32 @@ python main.py train ... \
 ```
 
 恢复时命令中的模型、数据、比例和主要训练配置必须与原实验一致。
+checkpoint 会保存 Python、NumPy、PyTorch CPU/CUDA 和 DataLoader 随机状态；恢复时
+代码会校验配置、接续原训练历史，并把恢复命令追加到 `resume_commands.log`。
+
+## 按 SNR 评估
+
+数据文件没有逐样本 SNR 字段，因此分组必须显式声明并通过总样本数校验：
+
+```bash
+python main.py evaluate \
+  --checkpoint runs/<run>/checkpoints/best_checkpoint.pth \
+  --domain mobility --split test --per-snr \
+  --snr-values=-10,-5,0,5,10,15,20,25,30 \
+  --samples-per-snr 1000
+```
+
+若测试集样本数不等于 `SNR 数量 × 每组样本数`，或样本已被抽样/重排，程序会拒绝
+生成可能错误的标签。
 
 ## 输出与公平性
 
 - 训练仅使用官方 train/validation split 选择最佳 checkpoint；
 - test split 只通过独立 `evaluate` 命令读取；
 - 每个 run 保存完整命令、best/last checkpoint、训练历史 CSV 和结果 JSON；
+- Charbonnier、观测一致性和时间差分辅助项均按样本功率归一化；
+- 低 SNR 下观测一致性可能鼓励保留 LS 噪声，正式报告应包含 `--obs-weight 0`
+  及不同辅助权重的消融；
 - `.gitignore` 排除数据集、checkpoint 和实验输出，避免意外提交大文件；
 - 时变任务只做单帧内 `2 -> 6` 重建，不跨 MAT 样本拼接轨迹。
 
