@@ -18,7 +18,13 @@ def sample_nmse(
 def charbonnier(
     prediction: torch.Tensor, target: torch.Tensor, eps: float = 1e-3
 ) -> torch.Tensor:
-    return torch.sqrt((prediction - target).square() + eps**2).mean()
+    dims = tuple(range(1, prediction.ndim))
+    target_rms = target.square().mean(dim=dims).sqrt().clamp_min(1e-12)
+    robust_error = torch.sqrt(
+        (prediction - target).square()
+        + (eps * target_rms.reshape(-1, *([1] * (prediction.ndim - 1)))) ** 2
+    ).mean(dim=dims)
+    return (robust_error / target_rms).mean()
 
 
 def observation_consistency(
@@ -26,10 +32,12 @@ def observation_consistency(
     batch: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
     obs = batch["obs_h"]
-    ris = batch["obs_ris_index"][0] if batch["obs_ris_index"].ndim == 2 else batch["obs_ris_index"]
-    times = batch["obs_time_index"][0] if batch["obs_time_index"].ndim == 2 else batch["obs_time_index"]
+    ris_index = batch["obs_ris_index"]
+    time_index = batch["obs_time_index"]
+    ris = ris_index[0] if ris_index.ndim == 2 else ris_index
+    times = time_index[0] if time_index.ndim == 2 else time_index
     selected = prediction.index_select(1, times).index_select(2, ris)
-    return (selected - obs).square().mean()
+    return sample_nmse(selected, obs).mean()
 
 
 def delta_nmse(
