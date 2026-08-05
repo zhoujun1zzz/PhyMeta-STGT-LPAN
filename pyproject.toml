@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "lpan-two-dataset"
 version = "0.1.0"
-description = "Unified LPAN quasi-static and time-varying RIS channel completion baselines and PhyMeta-STGT."
+description = "PhyMeta-STGT for unified quasi-static and time-varying LPAN RIS channel completion."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
