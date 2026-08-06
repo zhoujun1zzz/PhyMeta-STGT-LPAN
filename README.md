@@ -40,19 +40,6 @@ The proposed model combines:
 
 The default model contains 386,432 parameters. Adapter-plus-head transfer updates 25,216 parameters (6.53%) when the optional uncertainty head is disabled.
 
-## Reference results from the current manuscript draft
-
-The following values are reported at 10 dB SNR. Lower NMSE is better. Each value is the mean and standard deviation across five frozen seeds after sample-level linear NMSE is averaged within each seed and converted to decibels.
-
-| Task | Official LPAN-L | PhyMeta-STGT | Improvement |
-|---|---:|---:|---:|
-| Quasi-static | -14.40 +/- 0.14 dB | **-15.80 +/- 0.12 dB** | 1.40 dB |
-| Time-varying | -12.40 +/- 0.14 dB | **-14.10 +/- 0.12 dB** | 1.70 dB |
-
-For quasi-static-to-time-varying transfer with 5% of the target-domain training data, adapter-plus-head adaptation reports `-13.80 +/- 0.15 dB`, compared with `-12.60 +/- 0.15 dB` for full fine-tuning and `-10.40 +/- 0.12 dB` for target-only training at the same fraction.
-
-These values should be treated as manuscript-draft reference results until the final experiment artifacts and paper version are released.
-
 ## Installation
 
 Python 3.10 or later is required. CUDA is optional for smoke tests and recommended for full training.
