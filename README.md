@@ -17,28 +17,32 @@ PhyMeta-STGT provides a unified implementation for quasi-static spatial completi
 
 ## Overview
 
-The two LPAN tasks are represented through one masked sparse-observation-to-dense-query interface:
+The two LPAN tasks are represented through one sparse-observation-to-dense-query interface:
 
 | Domain | Sparse input | Dense target | Task |
 |---|---:|---:|---|
 | Quasi-static indoor | `[B, 1, 32, 64, 2]` | `[B, 1, 256, 64, 2]` | Spatial channel completion |
 | Time-varying outdoor | `[B, 2, 32, 64, 2]` | `[B, 6, 256, 64, 2]` | Joint spatial-temporal completion |
 
-The final dimension stores the real and imaginary components. Explicit observation and query masks prevent unobserved entries from being interpreted as measured zeros.
+The final dimension stores the real and imaginary components. The current official-data loader supplies only the 32 measured RIS tokens and emits an all-true `observation_mask`; it does not create a dense zero-filled input or a separate query mask. The mask is therefore an attention-padding interface for variable or padded inputs, not a learned missing-node representation in the current data path.
 
 ### PhyMeta-STGT architecture
 
-The proposed model combines:
+The current `PhyMetaSTGT` implementation combines:
 
-- masked sparse observation encoding with learned missing-node states;
+- sparse observed-token encoding and learned queries for all 256 RIS elements;
 - observed-to-all multi-head cross-attention for global access to pilot observations;
 - local edge-aware refinement on the four-neighbor RIS grid;
-- variable-length Transformer time queries for both `1 -> 1` and `2 -> 6` tasks;
+- learned scalar-time embeddings and multi-head temporal cross-attention for both `1 -> 1` and `2 -> 6` tasks;
 - a domain-conditioned FiLM adapter;
 - a shared node-wise complex-channel decoder; and
 - sample-level complex NMSE, Charbonnier, observation-consistency, and temporal-difference objectives.
 
-The default model contains 386,432 parameters. Adapter-plus-head transfer updates 25,216 parameters (6.53%) when the optional uncertainty head is disabled.
+With the default settings (`hidden=64`, four heads, and two graph layers), the current implementation contains 188,360 parameters. It has no uncertainty head. The adaptation-policy parameter counts are reported by each run and should be taken from its saved configuration rather than copied from an earlier manuscript draft.
+
+## Result provenance
+
+Smoke-test outputs are implementation checks and are not reportable results. Numerical manuscript claims, multi-seed statistics, confidence intervals, latency, memory, and MAC values must be regenerated from complete server-side run directories before release. No draft result is treated as reproduced merely because it appears in a figure or table.
 
 ## Installation
 
@@ -96,7 +100,7 @@ Run the read-only dataset audit before training:
 python main.py audit --data-root /path/to/data
 ```
 
-The audit records file locations, HDF5 keys, raw shapes, dtypes, and normalized interface shapes. It reads metadata and one sample from each split.
+The audit records file locations, HDF5 keys, raw shapes, dtypes, and canonical interface shapes. It reads metadata and one sample from each split. The loader does not fit or apply an additional normalization transform; it consumes the upstream preprocessed tensors stored in the LPAN files.
 
 ### Data semantics
 
@@ -138,6 +142,9 @@ python main.py ridge --domain mobility --max-train 512 --max-val 128
 ```
 
 Remove the `--max-*` limits for full experiments. Ridge regression reads the test split only when `--test` is supplied.
+
+> [!CAUTION]
+> The current linear spatial interpolation baseline operates along the flattened RIS index `0..255`. It is not a two-dimensional grid-aware interpolator and must not be described as physical 2D interpolation in the manuscript.
 
 ### Neural-model smoke tests
 
@@ -196,7 +203,9 @@ Supported adaptation protocols are:
 | Full fine-tuning | `--adaptation full` |
 | Frozen spatial encoder | `--adaptation frozen_spatial` |
 | Domain adapter only | `--adaptation adapter_only` |
-| Adapter plus channel head | `--adaptation selective` |
+| Selective temporal adaptation | `--adaptation selective` |
+
+In the current implementation, `selective` and `frozen_spatial` expose the same trainable parameter set: the time encoder, temporal attention, temporal normalization, domain embedding, and decoder. They should not be reported as distinct adaptation methods unless the code is changed to differentiate them. `adapter_only` updates the temporal normalization, domain embedding, and decoder.
 
 Recommended target fractions are `0.01`, `0.05`, `0.10`, `0.20`, and `1.0`. For a fixed seed, subsets are nested prefixes of one shuffled index manifest so that every smaller support set is contained in the larger sets.
 
@@ -222,6 +231,8 @@ Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random stat
 - GCN-GRU; and
 - PhyMeta-STGT.
 
+Official LPAN and LPAN-L architectures are not registered model options in this repository. They must be integrated or run through a separately validated official pipeline before the manuscript describes them as reproduced baselines under the same protocol.
+
 CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode positions `0..5`. They perform sequence-to-sequence reconstruction of the complete six-block frame, including the two pilot positions; they are not strict future-only predictors beginning at position 2.
 
 ## Evaluation and reproducibility
@@ -229,7 +240,7 @@ CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode posi
 - Model selection uses the training and validation splits only.
 - Test data are read only through the independent evaluation entry point.
 - NMSE is computed per sample in the linear domain before aggregation and a single conversion to decibels.
-- Completion-only metrics distinguish observed and unobserved RIS elements, and pilot and non-pilot time blocks.
+- Completion-only metrics report observed versus unobserved RIS elements and pilot versus non-pilot time blocks separately. The current evaluator does not report their intersection (unobserved RIS elements at non-pilot blocks) as a dedicated metric.
 - Every run stores the complete command, best and last checkpoints, training history, and JSON results.
 - Data, checkpoints, and experiment outputs are excluded by `.gitignore`.
 - The time-varying task is frame-internal `2 -> 6` reconstruction; samples are not concatenated into trajectories.
