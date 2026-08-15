@@ -6,6 +6,7 @@ from typing import Mapping
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.parametrizations import weight_norm
 
 from .graph import grid_coordinates, grid_edge_index, normalized_adjacency
 
@@ -110,6 +111,115 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + 0.1 * self.body(x)
+
+
+class LPANLChannelAttention(nn.Module):
+    """Channel attention used by the LPAN-L-derived direct baseline."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.gate = nn.Sequential(nn.Linear(channels, channels), nn.Tanh())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.gate(self.pool(x).flatten(1)).unsqueeze(-1).unsqueeze(-1)
+        return x * scale
+
+
+class LPANLResidualBlock(nn.Module):
+    """LPAN-L-style dilated residual block with channel attention."""
+
+    def __init__(self, channels: int, *, grouped: bool = False) -> None:
+        super().__init__()
+        first_groups = 16 if grouped and channels % 16 == 0 else 1
+        second_groups = 4 if grouped and channels % 4 == 0 else 1
+        self.conv1 = weight_norm(
+            nn.Conv2d(
+                channels,
+                channels,
+                3,
+                padding=2,
+                dilation=2,
+                groups=first_groups,
+            )
+        )
+        self.conv2 = weight_norm(
+            nn.Conv2d(
+                channels, channels, 3, padding=1, groups=second_groups
+            )
+        )
+        self.project = (
+            weight_norm(nn.Conv2d(channels, channels, 1))
+            if grouped
+            else nn.Identity()
+        )
+        self.activation = nn.LeakyReLU(negative_slope=0.2)
+        self.attention = LPANLChannelAttention(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.activation(self.conv1(x))
+        residual = self.activation(self.conv2(residual))
+        residual = self.project(residual)
+        return x + self.attention(residual)
+
+
+class LPANLDirect(nn.Module):
+    """Single-stage LPAN-L-derived baseline for the repository task contract.
+
+    Unlike the original progressive 2x/4x/8x reconstruction, this variant
+    extracts features on the 32-column input and resizes them directly to the
+    256-column target exactly once.  It returns only the final dense channel.
+    """
+
+    def __init__(
+        self,
+        obs_blocks: int,
+        query_blocks: int,
+        channels: int = 96,
+        body_blocks: int = 4,
+    ) -> None:
+        super().__init__()
+        self.obs_blocks = obs_blocks
+        self.query_blocks = query_blocks
+        self.target_nodes = 256
+        input_channels = 2 * obs_blocks
+        output_channels = 2 * query_blocks
+        self.head = weight_norm(nn.Conv2d(input_channels, channels, 3, padding=1))
+        blocks = [LPANLResidualBlock(channels, grouped=True)]
+        blocks.extend(
+            LPANLResidualBlock(channels) for _ in range(max(1, body_blocks - 1))
+        )
+        self.body = nn.Sequential(*blocks)
+        self.feature_refine = nn.Sequential(
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+        self.residual_head = weight_norm(
+            nn.Conv2d(channels, output_channels, 3, padding=1)
+        )
+        self.skip_head = nn.Conv2d(input_channels, output_channels, 3, padding=1)
+
+    def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        obs = batch["obs_h"]
+        b, t, p, m, _ = obs.shape
+        if p != 32:
+            raise ValueError(f"LPANLDirect expects 32 observed RIS columns, got {p}.")
+        x = obs.permute(0, 4, 1, 3, 2).reshape(b, 2 * t, m, p)
+        features = self.body(self.head(x))
+        features = F.interpolate(
+            features,
+            size=(m, self.target_nodes),
+            mode="nearest",
+        )
+        residual = self.residual_head(self.feature_refine(features))
+        skip = self.skip_head(
+            F.interpolate(x, size=(m, self.target_nodes), mode="nearest")
+        )
+        output = residual + skip
+        output = output.reshape(
+            b, 2, self.query_blocks, m, self.target_nodes
+        )
+        return output.permute(0, 2, 4, 3, 1).contiguous()
 
 
 class EDSRLite(nn.Module):
@@ -332,32 +442,68 @@ class PhyMetaSTGT(nn.Module):
         heads: int = 4,
         graph_layers: int = 2,
         dropout: float = 0.0,
+        ablation: str = "none",
     ) -> None:
         super().__init__()
+        valid_ablations = {
+            "none",
+            "no_spatial_cross_attention",
+            "no_graph",
+            "no_temporal_attention",
+            "no_domain_adapter",
+            "no_coordinate_encoding",
+        }
+        if ablation not in valid_ablations:
+            raise ValueError(
+                f"Unknown architectural ablation {ablation!r}; choose from "
+                f"{sorted(valid_ablations)}."
+            )
+        self.ablation = ablation
         self.hidden = hidden
         self.channel_encoder = nn.Sequential(
             nn.Linear(128, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
         )
-        self.coord_encoder = nn.Sequential(nn.Linear(2, hidden), nn.GELU())
-        self.node_query = nn.Parameter(torch.randn(256, hidden) * 0.02)
-        self.spatial_cross_attention = nn.MultiheadAttention(
-            hidden, heads, dropout=dropout, batch_first=True
+        self.coord_encoder = (
+            None
+            if ablation == "no_coordinate_encoding"
+            else nn.Sequential(nn.Linear(2, hidden), nn.GELU())
+        )
+        self.node_query = (
+            None
+            if ablation == "no_spatial_cross_attention"
+            else nn.Parameter(torch.randn(256, hidden) * 0.02)
+        )
+        self.spatial_cross_attention = (
+            None
+            if ablation == "no_spatial_cross_attention"
+            else nn.MultiheadAttention(
+                hidden, heads, dropout=dropout, batch_first=True
+            )
         )
         self.graph_layers = nn.ModuleList(
             SparseGraphAttention(hidden, heads, dropout)
-            for _ in range(graph_layers)
+            for _ in range(0 if ablation == "no_graph" else graph_layers)
         )
         self.time_encoder = nn.Sequential(
             nn.Linear(1, hidden), nn.GELU(), nn.Linear(hidden, hidden)
         )
-        self.temporal_attention = nn.MultiheadAttention(
-            hidden, heads, dropout=dropout, batch_first=True
+        self.temporal_attention = (
+            None
+            if ablation == "no_temporal_attention"
+            else nn.MultiheadAttention(
+                hidden, heads, dropout=dropout, batch_first=True
+            )
         )
         self.temporal_norm = nn.LayerNorm(hidden)
-        self.domain_embedding = nn.Embedding(2, 2 * hidden)
-        nn.init.zeros_(self.domain_embedding.weight)
+        self.domain_embedding = (
+            None
+            if ablation == "no_domain_adapter"
+            else nn.Embedding(2, 2 * hidden)
+        )
+        if self.domain_embedding is not None:
+            nn.init.zeros_(self.domain_embedding.weight)
         self.decoder = nn.Sequential(
             nn.LayerNorm(hidden),
             nn.Linear(hidden, 2 * hidden),
@@ -367,15 +513,13 @@ class PhyMetaSTGT(nn.Module):
         self.register_buffer("node_xy", grid_coordinates(), persistent=False)
 
     def spatial_parameters(self):
-        modules = [
-            self.channel_encoder,
-            self.coord_encoder,
-            self.spatial_cross_attention,
-            self.graph_layers,
-        ]
+        modules = [self.channel_encoder, self.coord_encoder, self.spatial_cross_attention]
+        modules.append(self.graph_layers)
         for module in modules:
-            yield from module.parameters()
-        yield self.node_query
+            if module is not None:
+                yield from module.parameters()
+        if self.node_query is not None:
+            yield self.node_query
 
     def encode_space(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         obs = batch["obs_h"]
@@ -383,17 +527,27 @@ class PhyMetaSTGT(nn.Module):
         index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
         xy = self.node_xy.to(obs)
         observed = self.channel_encoder(obs.reshape(b * t, p, 128))
-        observed = observed + self.coord_encoder(xy[index]).unsqueeze(0)
+        if self.coord_encoder is not None:
+            observed = observed + self.coord_encoder(xy[index]).unsqueeze(0)
         observation_mask = batch["observation_mask"].reshape(b * t, p).bool()
         observed = observed * observation_mask.unsqueeze(-1)
-        query = self.node_query.to(obs).unsqueeze(0) + self.coord_encoder(xy).unsqueeze(0)
-        query = query.expand(b * t, -1, -1)
-        x, _ = self.spatial_cross_attention(
-            query,
-            observed,
-            observed,
-            key_padding_mask=~observation_mask,
-        )
+        if self.spatial_cross_attention is None:
+            dense = expand_observations_to_grid(batch).reshape(b * t, 256, 128)
+            x = self.channel_encoder(dense)
+            if self.coord_encoder is not None:
+                x = x + self.coord_encoder(xy).unsqueeze(0)
+        else:
+            assert self.node_query is not None
+            query = self.node_query.to(obs).unsqueeze(0)
+            if self.coord_encoder is not None:
+                query = query + self.coord_encoder(xy).unsqueeze(0)
+            query = query.expand(b * t, -1, -1)
+            x, _ = self.spatial_cross_attention(
+                query,
+                observed,
+                observed,
+                key_padding_mask=~observation_mask,
+            )
         x = x.reshape(b, t, 256, self.hidden)
         for layer in self.graph_layers:
             x = layer(x)
@@ -409,16 +563,24 @@ class PhyMetaSTGT(nn.Module):
         query_pos = self.time_encoder(
             (query_time.float() / scale).view(query_time.numel(), 1)
         )
-        memory = spatial.permute(0, 2, 1, 3).reshape(b * n, t, h)
-        memory = memory + obs_pos.unsqueeze(0)
         query = query_pos.unsqueeze(0).expand(b * n, -1, -1)
-        temporal, _ = self.temporal_attention(query, memory, memory)
-        temporal = self.temporal_norm(temporal + query)
-        domain = batch["domain_id"].reshape(b).to(spatial.device)
-        gamma, beta = self.domain_embedding(domain).chunk(2, dim=-1)
-        q = temporal.shape[1]
+        if self.temporal_attention is None:
+            weights = linear_query_weights(obs_time, query_time).to(spatial.dtype)
+            temporal = torch.einsum("qt,btnh->bnqh", weights, spatial)
+            q = temporal.shape[2]
+            temporal = temporal.reshape(b * n, q, h)
+            temporal = self.temporal_norm(temporal + query)
+        else:
+            memory = spatial.permute(0, 2, 1, 3).reshape(b * n, t, h)
+            memory = memory + obs_pos.unsqueeze(0)
+            temporal, _ = self.temporal_attention(query, memory, memory)
+            temporal = self.temporal_norm(temporal + query)
+            q = temporal.shape[1]
         temporal = temporal.reshape(b, n, q, h)
-        temporal = temporal * (1 + gamma[:, None, None]) + beta[:, None, None]
+        if self.domain_embedding is not None:
+            domain = batch["domain_id"].reshape(b).to(spatial.device)
+            gamma, beta = self.domain_embedding(domain).chunk(2, dim=-1)
+            temporal = temporal * (1 + gamma[:, None, None]) + beta[:, None, None]
         output = self.decoder(temporal).reshape(b, n, q, 64, 2)
         return output.permute(0, 2, 1, 3, 4).contiguous()
 
@@ -431,11 +593,14 @@ def build_model(
     graph_layers: int = 2,
     heads: int = 4,
     dropout: float = 0.0,
+    ablation: str = "none",
 ) -> nn.Module:
     name = name.lower().replace("-", "_")
     blocks = (1, 1) if domain == "quasi" else (2, 6)
     if name in {"edsr", "edsr_lite"}:
         return EDSRLite(*blocks, hidden=max(32, hidden), layers=graph_layers + 2)
+    if name in {"lpan_l_direct", "lpanl_direct", "lpan_l"}:
+        return LPANLDirect(*blocks)
     if name in {"spatial_gcn", "gcn"}:
         return SpatialGCN(hidden, graph_layers)
     if name in {"cnn_gru", "cnngru"}:
@@ -443,8 +608,8 @@ def build_model(
     if name in {"gcn_gru", "gcngru"}:
         return GCNGRU(hidden, graph_layers)
     if name in {"phymeta_stgt", "stgt", "ours"}:
-        return PhyMetaSTGT(hidden, heads, graph_layers, dropout)
+        return PhyMetaSTGT(hidden, heads, graph_layers, dropout, ablation)
     raise ValueError(
-        f"Unknown model {name!r}; choose edsr_lite, spatial_gcn, cnn_gru, "
-        "gcn_gru, or phymeta_stgt."
+        f"Unknown model {name!r}; choose lpan_l_direct, edsr_lite, "
+        "spatial_gcn, cnn_gru, gcn_gru, or phymeta_stgt."
     )

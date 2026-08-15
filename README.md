@@ -44,6 +44,8 @@ With the default settings (`hidden=64`, four heads, and two graph layers), the c
 
 Smoke-test outputs are implementation checks and are not reportable results. Numerical manuscript claims, multi-seed statistics, confidence intervals, latency, memory, and MAC values must be regenerated from complete server-side run directories before release. No draft result is treated as reproduced merely because it appears in a figure or table.
 
+Verified baseline evidence that predates this unified repository is recorded in [`docs/experiment_evidence.md`](docs/experiment_evidence.md). In particular, the official progressive Mobility LPAN-L run has 1,112,904 parameters, validation NMSE `-21.6269 dB`, and frozen 9000-frame independent-test NMSE `-19.7268 dB`. These values belong to the progressive official architecture and must not be assigned to `lpan_l_direct`.
+
 ## Installation
 
 Python 3.10 or later is required. CUDA is optional for smoke tests and recommended for full training.
@@ -150,6 +152,7 @@ Remove the `--max-*` limits for full experiments. Ridge regression reads the tes
 
 ```bash
 python main.py train --domain quasi --model edsr_lite --mode smoke
+python main.py train --domain quasi --model lpan_l_direct --mode smoke
 python main.py train --domain quasi --model spatial_gcn --mode smoke
 python main.py train --domain mobility --model cnn_gru --mode smoke
 python main.py train --domain mobility --model gcn_gru --mode smoke
@@ -157,6 +160,18 @@ python main.py train --domain mobility --model phymeta_stgt --mode smoke
 ```
 
 Smoke mode uses 64 training samples, 16 validation samples, and one epoch. Its outputs are implementation checks, not reportable performance results.
+
+### Direct 32-to-256 LPAN-L baseline
+
+`lpan_l_direct` is an LPAN-L-derived comparison model adapted to this repository's task contract. It retains dilated residual processing and channel attention, but replaces the original progressive `32 -> 64 -> 128 -> 256` reconstruction with one direct `32 -> 256` resize-and-reconstruction stage. It returns only the final dense channel tensor, with shape `[B, 1, 256, 64, 2]` for quasi-static data and `[B, 6, 256, 64, 2]` for mobility data.
+
+```bash
+python main.py train --domain quasi --model lpan_l_direct --mode full \
+  --epochs 100 --run-name quasi_lpan_l_direct_seed123
+
+python main.py train --domain mobility --model lpan_l_direct --mode full \
+  --epochs 100 --run-name mobility_lpan_l_direct_seed123
+```
 
 ### Independent training and held-out evaluation
 
@@ -211,6 +226,61 @@ Recommended target fractions are `0.01`, `0.05`, `0.10`, `0.20`, and `1.0`. For 
 
 The `--pretrained` option accepts only a structurally compatible PhyMeta-STGT checkpoint and performs strict model-configuration and state-dictionary validation.
 
+### Hyperparameter search
+
+The `tune` command performs a deterministic grid or seeded random search using only the training and validation splits. Every trial uses the same data subset and training seed, saves a complete run directory, and is ranked by the minimum sample-level linear validation NMSE. The test split is never read by this command.
+
+```bash
+python main.py tune --domain mobility --mode full \
+  --strategy random --max-trials 12 --epochs 100 \
+  --hidden-values 48,64,96 \
+  --graph-layer-values 1,2,3 \
+  --head-values 4,8 \
+  --dropout-values 0,0.1 \
+  --learning-rate-values 1e-4,2e-4,5e-4 \
+  --weight-decay-values 0,1e-5 \
+  --study-name mobility_hparam_seed123
+```
+
+The selected configuration and checkpoint are written to `runs/<study_name>/best_result.json`; all attempted configurations remain in `trials.csv` and `trials.json`. A smoke search verifies the pipeline but is not a reportable optimum.
+
+### Parameters, GMACs, and GFLOPs
+
+Use the built-in profiler to compare registered models under exactly the same domain-specific input, batch size, precision, and forward-pass scope:
+
+```bash
+python main.py profile --domain mobility --batch-size 1 --device cpu \
+  --models lpan_l_direct,edsr_lite,spatial_gcn,cnn_gru,gcn_gru,phymeta_stgt \
+  --output runs/mobility_complexity.json
+
+python main.py profile --domain quasi --batch-size 1 --device cpu \
+  --models lpan_l_direct,edsr_lite,spatial_gcn,phymeta_stgt \
+  --output runs/quasi_complexity.json
+```
+
+The command writes both JSON and CSV and prints `parameters`, `GMACs`, and `GFLOPs`. The fixed convention is one FP32 forward pass with batch size one and `1 MAC = 2 FLOPs`; backward, bias, normalization, activation, softmax, indexing, and interpolation costs are excluded. Every training run also records the same canonical complexity profile in `results/final_result.json`.
+
+The checked-in same-condition tables and machine-readable outputs are in [`reports/complexity_summary.md`](reports/complexity_summary.md). For the mobility task, the current PhyMeta-STGT measures `188,360` parameters, `0.114 GMACs`, and `0.228 GFLOPs`; the separately profiled official progressive LPAN-L measures `1,112,904` parameters, `6.338 GMACs`, and `12.676 GFLOPs` under the identical convention.
+
+Do not place THOP MACs, paper-reported FLOPs, and profiler FLOPs in one column without reconciling their definitions. The official progressive LPAN-L and the task-adapted single-stage `lpan_l_direct` must be reported as separate architectures.
+
+### Controlled ablation study
+
+The `ablate` command runs the full model and one-factor variants under the same seed, data fraction, optimizer settings, and epoch budget. Available variants remove spatial cross-attention, graph refinement, temporal attention, the domain adapter, coordinate encoding, or individual auxiliary losses. Quasi-static studies automatically omit the inapplicable temporal-difference-loss ablation.
+
+```bash
+python main.py ablate --domain mobility --mode full --epochs 100 \
+  --study-name mobility_ablation_seed123
+
+python main.py ablate --domain mobility --mode full --epochs 100 \
+  --variants none,no_spatial_cross_attention,no_graph,no_temporal_attention,\
+no_domain_adapter,no_coordinate_encoding,nmse_only,no_charbonnier_loss,\
+no_observation_loss,no_temporal_delta_loss \
+  --study-name mobility_ablation_selected_seed123
+```
+
+Each result is selected independently on validation NMSE. `summary.json` reports the dB change relative to the full model; final test evaluation should be run only after the ablation protocol and checkpoint-selection rule are frozen.
+
 ### Resume a run
 
 ```bash
@@ -225,13 +295,15 @@ Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random stat
 
 - LS coarse-channel interpolation;
 - empirical Ridge regression with validation-selected regularization;
+- direct single-stage LPAN-L-derived baseline (`lpan_l_direct`);
 - EDSR-lite;
 - Spatial GCN;
 - CNN-GRU;
 - GCN-GRU; and
 - PhyMeta-STGT.
 
-Official LPAN and LPAN-L architectures are not registered model options in this repository. They must be integrated or run through a separately validated official pipeline before the manuscript describes them as reproduced baselines under the same protocol.
+`lpan_l_direct` is intentionally a task-adapted, single-stage LPAN-L-derived baseline and must not be labeled as an unchanged reproduction of the official progressive LPAN-L architecture.
+The official progressive LPAN-L is not a registered training option in this repository. Its source implementation is handled only by the separate validated profiling script and external baseline pipeline.
 
 CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode positions `0..5`. They perform sequence-to-sequence reconstruction of the complete six-block frame, including the two pilot positions; they are not strict future-only predictors beginning at position 2.
 
