@@ -17,6 +17,7 @@ import numpy as np
 
 EPS = np.finfo(np.float64).eps
 OBSERVED = np.arange(0, 256, 8, dtype=np.int64)
+LAYOUTS = ("grouped", "interleaved")
 
 
 def _read_prefix(path: Path, key: str, samples: int) -> np.ndarray:
@@ -49,6 +50,65 @@ def _decode(raw: np.ndarray, blocks: int, layout: str) -> np.ndarray:
     else:
         raise ValueError(layout)
     return (real + 1j * imag).transpose(3, 0, 1, 2)
+
+
+def _channel_labels(blocks: int, layout: str) -> list[str]:
+    if layout == "grouped":
+        return [f"Re(t{block})" for block in range(1, blocks + 1)] + [
+            f"Im(t{block})" for block in range(1, blocks + 1)
+        ]
+    if layout == "interleaved":
+        return [
+            component
+            for block in range(1, blocks + 1)
+            for component in (f"Re(t{block})", f"Im(t{block})")
+        ]
+    raise ValueError(layout)
+
+
+def _infer_layout(
+    pair_scores: dict[tuple[str, str], float],
+    minimum_margin: float,
+) -> dict[str, object]:
+    """Infer Yd/Hd layouts from mapped input-to-target correlations."""
+
+    if minimum_margin < 0:
+        raise ValueError("minimum_margin must be non-negative.")
+    ranking = sorted(pair_scores.items(), key=lambda item: item[1], reverse=True)
+    (best_y, best_h), best_score = ranking[0]
+    runner_score = ranking[1][1]
+    margin = best_score - runner_score
+    if margin < minimum_margin:
+        status = "ambiguous"
+        verified_layout = None
+    elif best_y != best_h:
+        status = "inconsistent"
+        verified_layout = None
+    else:
+        status = "verified"
+        verified_layout = best_y
+    return {
+        "status": status,
+        "verified_layout": verified_layout,
+        "inferred_Yd_layout": best_y,
+        "inferred_Hd_layout": best_h,
+        "best_pair_score": float(best_score),
+        "runner_up_score": float(runner_score),
+        "margin": float(margin),
+        "minimum_required_margin": float(minimum_margin),
+        "criterion": (
+            "highest correlation between Yd pilot blocks and the matching "
+            "Hd blocks at the authoritative observed RIS indices"
+        ),
+        "ranking": [
+            {
+                "Yd_layout": y_layout,
+                "Hd_layout": h_layout,
+                "score": float(score),
+            }
+            for (y_layout, h_layout), score in ranking
+        ],
+    }
 
 
 def verify_quasi(path: Path, samples: int) -> dict[str, object]:
@@ -87,12 +147,15 @@ def verify_quasi(path: Path, samples: int) -> dict[str, object]:
     }
 
 
-def verify_mobility(path: Path, samples: int) -> dict[str, object]:
+def verify_mobility(
+    path: Path,
+    samples: int,
+    minimum_layout_margin: float = 1e-3,
+) -> dict[str, object]:
     y_raw = _read_prefix(path, "Yd", samples)
     h_raw = _read_prefix(path, "Hd", samples)
-    layouts = ("grouped", "interleaved")
-    decoded_y = {layout: _decode(y_raw, 2, layout) for layout in layouts}
-    decoded_h = {layout: _decode(h_raw, 6, layout) for layout in layouts}
+    decoded_y = {layout: _decode(y_raw, 2, layout) for layout in LAYOUTS}
+    decoded_h = {layout: _decode(h_raw, 6, layout) for layout in LAYOUTS}
 
     adjacent = {}
     for layout, target in decoded_h.items():
@@ -102,7 +165,7 @@ def verify_mobility(path: Path, samples: int) -> dict[str, object]:
         ]
         adjacent[layout] = float(np.mean(np.concatenate(scores)))
 
-    mapped = {}
+    pair_scores: dict[tuple[str, str], float] = {}
     for y_layout, obs in decoded_y.items():
         for h_layout, target in decoded_h.items():
             scores = [
@@ -111,20 +174,36 @@ def verify_mobility(path: Path, samples: int) -> dict[str, object]:
                 )
                 for block in range(2)
             ]
-            mapped[f"Y_{y_layout}__H_{h_layout}"] = float(
+            pair_scores[(y_layout, h_layout)] = float(
                 np.mean(np.concatenate(scores))
             )
+
+    inference = _infer_layout(pair_scores, minimum_layout_margin)
+    verified_layout = inference["verified_layout"]
+    mapped = {
+        f"Y_{y_layout}__H_{h_layout}": score
+        for (y_layout, h_layout), score in pair_scores.items()
+    }
 
     return {
         "samples": int(y_raw.shape[3]),
         "target_adjacent_block_correlation": adjacent,
         "mapped_input_target_correlation": mapped,
-        "verified_layout": "grouped",
-        "raw_Yd_channels": ["Re(t1)", "Re(t2)", "Im(t1)", "Im(t2)"],
-        "raw_Hd_channels": [
-            "Re(t1)", "Re(t2)", "Re(t3)", "Re(t4)", "Re(t5)", "Re(t6)",
-            "Im(t1)", "Im(t2)", "Im(t3)", "Im(t4)", "Im(t5)", "Im(t6)",
-        ],
+        "layout_inference": inference,
+        "verified_layout": verified_layout,
+        "raw_Yd_channels": (
+            _channel_labels(2, str(verified_layout)) if verified_layout else None
+        ),
+        "raw_Hd_channels": (
+            _channel_labels(6, str(verified_layout)) if verified_layout else None
+        ),
+        "candidate_channel_orders": {
+            layout: {
+                "Yd": _channel_labels(2, layout),
+                "Hd": _channel_labels(6, layout),
+            }
+            for layout in LAYOUTS
+        },
     }
 
 
@@ -133,6 +212,15 @@ def main() -> None:
     parser.add_argument("--quasi", type=Path, required=True)
     parser.add_argument("--mobility", type=Path, nargs="+", required=True)
     parser.add_argument("--samples", type=int, default=128)
+    parser.add_argument(
+        "--minimum-layout-margin",
+        type=float,
+        default=1e-3,
+        help=(
+            "Minimum absolute correlation lead over the runner-up layout "
+            "combination required for a verified decision."
+        ),
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -147,7 +235,11 @@ def main() -> None:
         },
         "quasi": verify_quasi(args.quasi, args.samples),
         "mobility": {
-            str(path): verify_mobility(path, args.samples)
+            str(path): verify_mobility(
+                path,
+                args.samples,
+                minimum_layout_margin=args.minimum_layout_margin,
+            )
             for path in args.mobility
         },
     }

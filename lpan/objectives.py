@@ -37,7 +37,24 @@ def observation_consistency(
     ris = ris_index[0] if ris_index.ndim == 2 else ris_index
     times = time_index[0] if time_index.ndim == 2 else time_index
     selected = prediction.index_select(1, times).index_select(2, ris)
-    return sample_nmse(selected, obs).mean()
+    mask = batch["observation_mask"].to(device=obs.device, dtype=torch.bool)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if tuple(mask.shape) != tuple(obs.shape[:3]):
+        raise ValueError(
+            "observation_mask must match [batch, observed_time, observed_RIS]."
+        )
+    valid_per_sample = mask.reshape(mask.shape[0], -1).any(dim=1)
+    if not bool(valid_per_sample.all()):
+        raise ValueError(
+            "observation_consistency requires at least one valid observation "
+            "for every sample."
+        )
+    expanded_mask = mask.unsqueeze(-1).unsqueeze(-1).to(obs.dtype)
+    dims = tuple(range(1, obs.ndim))
+    numerator = ((selected - obs).square() * expanded_mask).sum(dim=dims)
+    denominator = (obs.square() * expanded_mask).sum(dim=dims)
+    return (numerator / denominator.clamp_min(1e-12)).mean()
 
 
 def delta_nmse(

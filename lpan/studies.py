@@ -21,6 +21,64 @@ LOSS_ABLATIONS = (
     "no_temporal_delta_loss",
 )
 ABLATION_VARIANTS = ("none",) + ARCHITECTURE_ABLATIONS + LOSS_ABLATIONS
+ABLATION_METADATA = {
+    "none": {
+        "display_name": "Full model",
+        "replacement_mechanism": None,
+    },
+    "no_spatial_cross_attention": {
+        "display_name": (
+            "w/o spatial cross-attention "
+            "(row-wise grid-aware interpolation replacement)"
+        ),
+        "replacement_mechanism": "row-wise grid-aware spatial interpolation",
+    },
+    "no_graph": {
+        "display_name": "w/o local graph refinement",
+        "replacement_mechanism": "identity (graph layers removed)",
+    },
+    "no_temporal_attention": {
+        "display_name": (
+            "w/o temporal attention "
+            "(deterministic temporal interpolation replacement)"
+        ),
+        "replacement_mechanism": (
+            "linear temporal interpolation with nearest-value extension"
+        ),
+    },
+    "no_domain_adapter": {
+        "display_name": "w/o domain-conditioned FiLM adapter",
+        "replacement_mechanism": "identity (domain FiLM disabled)",
+    },
+    "no_coordinate_encoding": {
+        "display_name": "w/o RIS coordinate encoding",
+        "replacement_mechanism": "coordinate features omitted",
+    },
+    "nmse_only": {
+        "display_name": "NMSE loss only",
+        "replacement_mechanism": "all auxiliary losses assigned zero weight",
+    },
+    "no_charbonnier_loss": {
+        "display_name": "w/o Charbonnier loss",
+        "replacement_mechanism": "Charbonnier weight set to zero",
+    },
+    "no_observation_loss": {
+        "display_name": "w/o observation-consistency loss",
+        "replacement_mechanism": "observation-consistency weight set to zero",
+    },
+    "no_temporal_delta_loss": {
+        "display_name": "w/o temporal-difference loss",
+        "replacement_mechanism": "temporal-difference weight set to zero",
+    },
+}
+
+
+def ablation_metadata(variant: str) -> dict[str, str | None]:
+    if variant not in ABLATION_METADATA:
+        raise ValueError(
+            f"Unknown ablation {variant!r}; choose from {ABLATION_VARIANTS}."
+        )
+    return {"variant_id": variant, **ABLATION_METADATA[variant]}
 
 
 def architectural_ablation(variant: str) -> str:

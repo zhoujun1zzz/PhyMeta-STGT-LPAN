@@ -24,6 +24,7 @@ SPECS = {
     # The two pilot blocks are the first two blocks in the six-block frame.
     "mobility": DatasetSpec("mobility", 2, 6, 1, (0, 1)),
 }
+SEMANTIC_PROFILES = ("official_lpan", "custom")
 
 
 def default_observed_ris_indices() -> tuple[int, ...]:
@@ -34,6 +35,44 @@ def default_observed_ris_indices() -> tuple[int, ...]:
     ``Gamma=8``, so the stored Yd columns map to ``0, 8, ..., 248``.
     """
     return tuple(range(0, 256, 8))
+
+
+def validate_semantic_profile(
+    *,
+    profile: str,
+    domain: str,
+    obs_ris_index: Sequence[int],
+    obs_time_index: Sequence[int],
+    complex_layout: str,
+) -> None:
+    if profile not in SEMANTIC_PROFILES:
+        raise ValueError(f"semantic_profile must be one of {SEMANTIC_PROFILES}.")
+    if profile == "custom":
+        return
+    expected_ris = default_observed_ris_indices()
+    expected_times = SPECS[domain].obs_time_index
+    mismatches: dict[str, object] = {}
+    if tuple(obs_ris_index) != expected_ris:
+        mismatches["obs_ris_index"] = {
+            "expected": list(expected_ris),
+            "received": list(obs_ris_index),
+        }
+    if tuple(obs_time_index) != expected_times:
+        mismatches["obs_time_index"] = {
+            "expected": list(expected_times),
+            "received": list(obs_time_index),
+        }
+    if complex_layout != "grouped":
+        mismatches["complex_layout"] = {
+            "expected": "grouped",
+            "received": complex_layout,
+        }
+    if mismatches:
+        raise ValueError(
+            "official_lpan semantic profile rejects labels that do not match "
+            f"the stored official columns: {mismatches}. Use profile='custom' "
+            "only for an independently rearranged or regenerated dataset."
+        )
 
 
 class LPANH5Dataset(Dataset):
@@ -50,6 +89,7 @@ class LPANH5Dataset(Dataset):
         # Official LPAN mobility files store all real time blocks first,
         # followed by all imaginary time blocks.
         complex_layout: str = "grouped",
+        semantic_profile: str = "official_lpan",
         max_samples: int | None = None,
         fraction: float = 1.0,
         subset_seed: int = 123,
@@ -65,6 +105,7 @@ class LPANH5Dataset(Dataset):
         if complex_layout not in {"grouped", "interleaved"}:
             raise ValueError("complex_layout must be grouped or interleaved.")
         self.complex_layout = complex_layout
+        self.semantic_profile = semantic_profile
         self.obs_ris_index = tuple(
             default_observed_ris_indices()
             if obs_ris_index is None
@@ -93,6 +134,13 @@ class LPANH5Dataset(Dataset):
             )
         if min(self.obs_time_index) < 0 or max(self.obs_time_index) >= self.spec.query_blocks:
             raise ValueError("Observation time indices fall outside the target frame.")
+        validate_semantic_profile(
+            profile=self.semantic_profile,
+            domain=self.domain,
+            obs_ris_index=self.obs_ris_index,
+            obs_time_index=self.obs_time_index,
+            complex_layout=self.complex_layout,
+        )
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
         if not h5py.is_hdf5(self.path):

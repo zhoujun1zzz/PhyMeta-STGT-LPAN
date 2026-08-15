@@ -15,7 +15,11 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from lpan.complexity import canonical_batch, profile_model_complexity
+from lpan.complexity import (
+    INTERPOLATION_POLICY,
+    canonical_batch,
+    profile_model_complexity,
+)
 from lpan.data import LPANH5Dataset
 from lpan.engine import (
     capture_rng_state,
@@ -43,6 +47,7 @@ from lpan.ridge import EmpiricalRidge, RidgeStatistics
 from lpan.studies import (
     ABLATION_VARIANTS,
     ARCHITECTURE_ABLATIONS,
+    ablation_metadata,
     ablated_loss_weights,
     architectural_ablation,
     hyperparameter_candidates,
@@ -51,6 +56,40 @@ from lpan.studies import (
 
 PROJECT = Path(__file__).resolve().parent
 DEFAULT_DATA_ROOT = default_data_root(PROJECT)
+MOBILITY_EXPECTED_SAMPLES = {
+    "train": 20000,
+    "validation": 1800,
+    "test": 9000,
+}
+MODEL_DISPLAY_NAMES = {
+    "lpan_l_direct": "LPAN-L-Direct",
+    "edsr_lite": "EDSR-lite",
+    "spatial_gcn": "Spatial GCN",
+    "cnn_gru": "CNN-GRU",
+    "gcn_gru": "GCN-GRU",
+    "phymeta_stgt": "PhyMeta-STGT",
+}
+
+
+def infer_semantic_profile(
+    domain: str,
+    obs_times: object,
+    obs_ris_indices: object,
+    complex_layout: object,
+) -> str:
+    expected_times = (0, 1) if domain == "mobility" else (0,)
+    try:
+        times = tuple(obs_times)  # type: ignore[arg-type]
+        indices = tuple(obs_ris_indices)  # type: ignore[arg-type]
+    except TypeError:
+        return "custom"
+    return (
+        "official_lpan"
+        if times == expected_times
+        and indices == tuple(range(0, 256, 8))
+        and complex_layout == "grouped"
+        else "custom"
+    )
 
 
 def ints(value: str) -> tuple[int, ...]:
@@ -90,6 +129,7 @@ def make_loader(
     obs_times: tuple[int, ...] | None = None,
     obs_ris_indices: tuple[int, ...] | None = None,
     complex_layout: str = "grouped",
+    semantic_profile: str = "official_lpan",
     shuffle: bool = False,
 ) -> DataLoader:
     dataset = LPANH5Dataset(
@@ -102,6 +142,7 @@ def make_loader(
         obs_time_index=obs_times,
         obs_ris_index=obs_ris_indices,
         complex_layout=complex_layout,
+        semantic_profile=semantic_profile,
     )
     generator = torch.Generator().manual_seed(seed)
     return DataLoader(
@@ -172,6 +213,7 @@ def audit_command(args: argparse.Namespace) -> None:
             },
         },
         "assumptions": {
+            "semantic_profile": args.semantic_profile,
             "complex_layout": args.complex_layout,
             "obs_ris_index": list(args.obs_ris_indices),
             "mobility_obs_time_index": list(args.mobility_obs_times),
@@ -199,6 +241,7 @@ def audit_command(args: argparse.Namespace) -> None:
             }
             if path.is_file():
                 try:
+                    entry["file_size_bytes"] = path.stat().st_size
                     if not h5py.is_hdf5(path):
                         raise ValueError("Not an HDF5/MATLAB v7.3 file")
                     with h5py.File(path, "r") as handle:
@@ -222,8 +265,25 @@ def audit_command(args: argparse.Namespace) -> None:
                         obs_time_index=obs_times,
                         obs_ris_index=args.obs_ris_indices,
                         complex_layout=args.complex_layout,
+                        semantic_profile=args.semantic_profile,
                     )
                     sample = dataset[0]
+                    entry["input_key"] = dataset.input_key
+                    entry["target_key"] = dataset.target_key
+                    entry["total_samples_in_file"] = dataset.total_samples_in_file
+                    dataset.close()
+                    if (
+                        args.semantic_profile == "official_lpan"
+                        and domain == "mobility"
+                    ):
+                        expected = MOBILITY_EXPECTED_SAMPLES[split]
+                        entry["expected_total_samples"] = expected
+                        if dataset.total_samples_in_file != expected:
+                            raise ValueError(
+                                f"Official Mobility {split} split expects "
+                                f"{expected} samples, found "
+                                f"{dataset.total_samples_in_file}."
+                            )
                     entry["unified_sample_shapes"] = {
                         key: list(value.shape)
                         for key, value in sample.items()
@@ -257,7 +317,13 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
             )
         model = build_model(name, **config).to(device)
         profile = profile_model_complexity(model, batch)
-        rows.append({"model": name, **profile})
+        rows.append(
+            {
+                "model": name,
+                "display_name": MODEL_DISPLAY_NAMES.get(name, name),
+                **profile,
+            }
+        )
         del model
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -271,6 +337,7 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
             "pass": "forward only",
             "test_data_read": False,
             "mac_flop_conversion": "1 MAC = 2 FLOPs",
+            "interpolation_policy": INTERPOLATION_POLICY,
         },
         "results": rows,
     }
@@ -282,6 +349,7 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
             handle,
             fieldnames=(
                 "model",
+                "display_name",
                 "total_parameters",
                 "trainable_parameters",
                 "gmacs",
@@ -417,6 +485,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         obs_times=obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
         shuffle=True,
     )
     val_loader = make_loader(
@@ -431,6 +500,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         obs_times=obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     config = model_config(args, domain)
     model = build_model(args.model, **config)
@@ -486,11 +556,13 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     weights = ablated_loss_weights(base_weights, ablation, domain=domain)
     metadata = {
         "domain": domain,
+        "model_display_name": MODEL_DISPLAY_NAMES.get(args.model, args.model),
         "mode": args.mode,
         "seed": args.seed,
         "obs_time_index": list(obs_times),
         "obs_ris_index": list(args.obs_ris_indices),
         "complex_layout": args.complex_layout,
+        "semantic_profile": args.semantic_profile,
         "train_fraction": args.fraction,
         "adaptation": args.adaptation,
         "ablation": ablation,
@@ -519,6 +591,14 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     if args.resume:
         state = torch.load(args.resume, map_location=device, weights_only=False)
         saved_metadata = state.get("metadata", {})
+        saved_semantic_profile = saved_metadata.get("semantic_profile") or (
+            infer_semantic_profile(
+                str(saved_metadata.get("domain")),
+                saved_metadata.get("obs_time_index"),
+                saved_metadata.get("obs_ris_index"),
+                saved_metadata.get("complex_layout"),
+            )
+        )
         checks = {
             "model_name": (state.get("model_name"), args.model),
             "model_config": (state.get("model_config"), config),
@@ -536,6 +616,10 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             "complex_layout": (
                 saved_metadata.get("complex_layout"),
                 metadata["complex_layout"],
+            ),
+            "semantic_profile": (
+                saved_semantic_profile,
+                metadata["semantic_profile"],
             ),
             "train_fraction": (
                 saved_metadata.get("train_fraction"),
@@ -619,10 +703,35 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             )
         best_nmse = float(state["best_nmse"])
         history = read_history(results / "training_history.csv")
-        if not history or int(history[-1]["epoch"]) != int(state["epoch"]):
+        checkpoint_epoch = int(state["epoch"])
+        history_epochs = [int(row["epoch"]) for row in history]
+        if not history or history_epochs != sorted(set(history_epochs)):
             raise ValueError(
-                "training_history.csv is missing or out of sync with checkpoint."
+                "training_history.csv is missing, duplicated, or not ordered."
             )
+        if history_epochs[-1] < checkpoint_epoch:
+            raise ValueError(
+                "training_history.csv does not contain the checkpoint epoch; "
+                "training metrics cannot be reconstructed safely."
+            )
+        if history_epochs[-1] > checkpoint_epoch:
+            original_last_epoch = history_epochs[-1]
+            history = [
+                row for row in history if int(row["epoch"]) <= checkpoint_epoch
+            ]
+            if not history or int(history[-1]["epoch"]) != checkpoint_epoch:
+                raise ValueError(
+                    "training_history.csv is ahead of the checkpoint but has "
+                    "no row matching the checkpoint epoch."
+                )
+            write_history(results / "training_history.csv", history)
+            with (run_dir / "recovery.log").open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"truncated training_history.csv from epoch "
+                    f"{original_last_epoch} to checkpoint epoch "
+                    f"{checkpoint_epoch}\n"
+                )
         restore_rng_state(
             state["rng_state"],
             {
@@ -837,12 +946,24 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
     best = completed[0]
     summary = {
         "status": "smoke_search" if args.mode == "smoke" else "validation_search",
+        "domain": args.domain,
         "study_dir": str(study_dir),
         "selection_metric": "minimum validation sample-level linear NMSE",
         "test_split_used": False,
         "completed_trials": len(completed),
         "failed_trials": len(rows) - len(completed),
         "best_trial": best,
+        "best_hyperparameters": {
+            key: best[key]
+            for key in (
+                "hidden",
+                "graph_layers",
+                "heads",
+                "dropout",
+                "learning_rate",
+                "weight_decay",
+            )
+        },
         "best_checkpoint": str(
             Path(str(best["run_dir"])) / "checkpoints" / "best_checkpoint.pth"
         ),
@@ -853,9 +974,98 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
     return summary
 
 
+ABLATION_HYPERPARAMETER_KEYS = (
+    "hidden",
+    "graph_layers",
+    "heads",
+    "dropout",
+    "learning_rate",
+    "weight_decay",
+)
+
+
+def _load_best_hyperparameters(
+    best_result_path: str | Path,
+    *,
+    expected_domain: str,
+    require_full_search: bool,
+) -> dict[str, int | float]:
+    """Load and validate the Stage-B configuration used by an ablation."""
+
+    path = Path(best_result_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if require_full_search and payload.get("status") != "validation_search":
+        raise ValueError(
+            "Full ablation requires best_result.json from a full "
+            "validation_search, not a smoke search."
+        )
+    recorded_domain = payload.get("domain")
+    search_plan = path.with_name("search_plan.json")
+    if recorded_domain is None and search_plan.is_file():
+        plan = json.loads(search_plan.read_text(encoding="utf-8"))
+        recorded_domain = plan.get("domain")
+    if recorded_domain is not None and recorded_domain != expected_domain:
+        raise ValueError(
+            f"Best-result domain {recorded_domain!r} does not match "
+            f"ablation domain {expected_domain!r}."
+        )
+    raw = payload.get("best_hyperparameters")
+    if not isinstance(raw, dict):
+        raw = payload.get("best_trial")
+    if not isinstance(raw, dict):
+        raise ValueError("best_result.json has no best hyperparameter mapping.")
+    missing = [key for key in ABLATION_HYPERPARAMETER_KEYS if key not in raw]
+    if missing:
+        raise ValueError(
+            f"best_result.json is missing hyperparameters: {missing}."
+        )
+    config: dict[str, int | float] = {
+        "hidden": int(raw["hidden"]),
+        "graph_layers": int(raw["graph_layers"]),
+        "heads": int(raw["heads"]),
+        "dropout": float(raw["dropout"]),
+        "learning_rate": float(raw["learning_rate"]),
+        "weight_decay": float(raw["weight_decay"]),
+    }
+    if int(config["hidden"]) <= 0 or int(config["heads"]) <= 0:
+        raise ValueError("Best-result hidden and heads must be positive.")
+    if int(config["hidden"]) % int(config["heads"]):
+        raise ValueError("Best-result hidden must be divisible by heads.")
+    if int(config["graph_layers"]) < 0:
+        raise ValueError("Best-result graph_layers must be non-negative.")
+    if not 0.0 <= float(config["dropout"]) < 1.0:
+        raise ValueError("Best-result dropout must be in [0, 1).")
+    if float(config["learning_rate"]) <= 0.0:
+        raise ValueError("Best-result learning_rate must be positive.")
+    if float(config["weight_decay"]) < 0.0:
+        raise ValueError("Best-result weight_decay must be non-negative.")
+    return config
+
+
 def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     """Run controlled one-factor ablations under a shared training protocol."""
 
+    if args.mode == "full" and args.best_result is None:
+        raise ValueError(
+            "Full ablation requires --best-result from the matching Stage-B "
+            "validation search so every variant inherits its hyperparameters."
+        )
+    inherited_hyperparameters = (
+        _load_best_hyperparameters(
+            args.best_result,
+            expected_domain=args.domain,
+            require_full_search=args.mode == "full",
+        )
+        if args.best_result is not None
+        else {
+            "hidden": args.hidden,
+            "graph_layers": args.graph_layers,
+            "heads": args.heads,
+            "dropout": args.dropout,
+            "learning_rate": args.learning_rate,
+            "weight_decay": args.weight_decay,
+        }
+    )
     variants = args.variants or ABLATION_VARIANTS
     if len(set(variants)) != len(variants):
         raise ValueError("--variants must not contain duplicates.")
@@ -886,11 +1096,13 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             args,
             study_dir,
             run_name,
+            **inherited_hyperparameters,
             ablation=variant,
         )
         row: dict[str, object] = {
             "order": index,
             "variant": variant,
+            **ablation_metadata(variant),
             "run_name": run_name,
         }
         try:
@@ -942,6 +1154,12 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "shared_seed": args.seed,
             "shared_data_fraction": args.fraction,
             "shared_epochs": 1 if args.mode == "smoke" else args.epochs,
+            "stage_b_best_result": (
+                str(Path(args.best_result).resolve())
+                if args.best_result is not None
+                else None
+            ),
+            "shared_hyperparameters": inherited_hyperparameters,
             "one_factor_changed_per_variant": True,
         },
         "full_model": reference,
@@ -967,7 +1185,7 @@ def load_checkpoint_model(
 def resolve_evaluation_semantics(
     args: argparse.Namespace,
     state: dict[str, object],
-) -> tuple[str, tuple[int, ...], tuple[int, ...], str]:
+) -> tuple[str, tuple[int, ...], tuple[int, ...], str, str]:
     raw_metadata = state.get("metadata")
     metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     saved_domain = metadata.get("domain")
@@ -1031,6 +1249,17 @@ def resolve_evaluation_semantics(
         args.complex_layout,
         "grouped",
     )
+    legacy_profile = infer_semantic_profile(
+        domain,
+        obs_times,
+        obs_ris_indices,
+        complex_layout,
+    )
+    semantic_profile = resolve(
+        "semantic_profile",
+        args.semantic_profile,
+        legacy_profile,
+    )
     if mismatches and not args.allow_semantic_override:
         raise ValueError(
             "Evaluation data semantics do not match checkpoint:\n"
@@ -1042,13 +1271,14 @@ def resolve_evaluation_semantics(
         tuple(obs_times),
         tuple(obs_ris_indices),
         str(complex_layout),
+        str(semantic_profile),
     )
 
 
 def evaluate_command(args: argparse.Namespace) -> None:
     device = device_from(args.device)
     model, state = load_checkpoint_model(args.checkpoint, device)
-    domain, obs_times, obs_ris_indices, complex_layout = (
+    domain, obs_times, obs_ris_indices, complex_layout, semantic_profile = (
         resolve_evaluation_semantics(args, state)
     )
     loader = make_loader(
@@ -1062,6 +1292,7 @@ def evaluate_command(args: argparse.Namespace) -> None:
         obs_times=obs_times,
         obs_ris_indices=obs_ris_indices,
         complex_layout=complex_layout,
+        semantic_profile=semantic_profile,
     )
     result = evaluate_model(model, loader, device)
     result.update(
@@ -1176,6 +1407,7 @@ def interpolation_command(args: argparse.Namespace) -> None:
         obs_times=obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     metrics = MetricAccumulator()
     for batch in loader:
@@ -1194,6 +1426,7 @@ def interpolation_command(args: argparse.Namespace) -> None:
             "obs_time_index": list(obs_times),
             "obs_ris_index": list(args.obs_ris_indices),
             "complex_layout": args.complex_layout,
+            "semantic_profile": args.semantic_profile,
         }
     )
     write_json(Path(args.output), result)
@@ -1213,6 +1446,7 @@ def ridge_command(args: argparse.Namespace) -> None:
         obs_times=obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     val_loader = make_loader(
         args.domain,
@@ -1225,6 +1459,7 @@ def ridge_command(args: argparse.Namespace) -> None:
         obs_times=obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     statistics = RidgeStatistics.accumulate(train_loader)
     candidates = []
@@ -1260,6 +1495,7 @@ def ridge_command(args: argparse.Namespace) -> None:
             obs_times=obs_times,
             obs_ris_indices=args.obs_ris_indices,
             complex_layout=args.complex_layout,
+            semantic_profile=args.semantic_profile,
         )
         report["independent_test"] = best_model.evaluate(test_loader)
     write_json(output, report)
@@ -1286,6 +1522,7 @@ def joint_command(args: argparse.Namespace) -> None:
         seed=args.seed,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     mobility_train = make_loader(
         "mobility",
@@ -1299,6 +1536,7 @@ def joint_command(args: argparse.Namespace) -> None:
         obs_times=args.obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     quasi_val = make_loader(
         "quasi",
@@ -1309,6 +1547,7 @@ def joint_command(args: argparse.Namespace) -> None:
         max_samples=max_val,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     mobility_val = make_loader(
         "mobility",
@@ -1320,6 +1559,7 @@ def joint_command(args: argparse.Namespace) -> None:
         obs_times=args.obs_times,
         obs_ris_indices=args.obs_ris_indices,
         complex_layout=args.complex_layout,
+        semantic_profile=args.semantic_profile,
     )
     run_name = args.run_name or f"joint_phymeta_stgt_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir = Path(args.output_root) / run_name
@@ -1338,6 +1578,7 @@ def joint_command(args: argparse.Namespace) -> None:
         "mobility_obs_time_index": list(args.obs_times),
         "obs_ris_index": list(args.obs_ris_indices),
         "complex_layout": args.complex_layout,
+        "semantic_profile": args.semantic_profile,
         "seed": args.seed,
     }
     for epoch in range(1, epochs + 1):
@@ -1439,6 +1680,15 @@ def add_data_semantics(
         choices=["grouped", "interleaved"],
         default=None if optional else "grouped",
         help="Raw real/imag channel ordering in Yd and Hd.",
+    )
+    parser.add_argument(
+        "--semantic-profile",
+        choices=["official_lpan", "custom"],
+        default=None if optional else "official_lpan",
+        help=(
+            "official_lpan locks the verified RIS/time/layout semantics; "
+            "custom is only for independently rearranged datasets."
+        ),
     )
 
 
@@ -1680,6 +1930,14 @@ def parser() -> argparse.ArgumentParser:
 
     ablate = commands.add_parser("ablate")
     add_study_training_protocol(ablate)
+    ablate.add_argument(
+        "--best-result",
+        type=Path,
+        help=(
+            "Stage-B best_result.json whose hyperparameters are inherited by "
+            "every ablation. Required in full mode."
+        ),
+    )
     ablate.add_argument(
         "--variants",
         type=strings,

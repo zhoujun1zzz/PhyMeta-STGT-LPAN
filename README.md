@@ -12,6 +12,8 @@ Research code accompanying the manuscript:
 
 PhyMeta-STGT provides a unified implementation for quasi-static spatial completion and time-varying spatio-temporal completion on the two LPAN RIS cascaded-channel datasets. The repository includes non-learning baselines, neural baselines, independent and balanced joint training, and parameter-efficient transfer from quasi-static to time-varying channels.
 
+The historical identifier `PhyMeta-STGT` does **not** denote meta-learning in this repository. The implemented model uses shared spatio-temporal parameters, physical RIS structure, domain conditioning, and ordinary supervised pretraining/fine-tuning; it has no episodic meta-training or inner/outer optimization loop.
+
 > [!IMPORTANT]
 > The manuscript is currently a draft. Dataset files and pretrained checkpoints are not distributed in this repository. Download the datasets from IEEE DataPort and follow the licensing and citation requirements on the corresponding dataset pages.
 
@@ -43,6 +45,8 @@ With the default settings (`hidden=64`, four heads, and two graph layers), the c
 ## Result provenance
 
 Smoke-test outputs are implementation checks and are not reportable results. Numerical manuscript claims, multi-seed statistics, confidence intervals, latency, memory, and MAC values must be regenerated from complete server-side run directories before release. No draft result is treated as reproduced merely because it appears in a figure or table.
+
+The two recent protocol-hardening rounds are summarized in Chinese in [`docs/two_round_modification_summary_zh.md`](docs/two_round_modification_summary_zh.md).
 
 Verified baseline evidence that predates this unified repository is recorded in [`docs/experiment_evidence.md`](docs/experiment_evidence.md). In particular, the official progressive Mobility LPAN-L run has 1,112,904 parameters, validation NMSE `-21.6269 dB`, and frozen 9000-frame independent-test NMSE `-19.7268 dB`. These values belong to the progressive official architecture and must not be assigned to `lpan_l_direct`.
 
@@ -102,7 +106,7 @@ Run the read-only dataset audit before training:
 python main.py audit --data-root /path/to/data
 ```
 
-The audit records file locations, HDF5 keys, raw shapes, dtypes, and canonical interface shapes. It reads metadata and one sample from each split. The loader does not fit or apply an additional normalization transform; it consumes the upstream preprocessed tensors stored in the LPAN files.
+The audit records file locations, byte sizes, HDF5 keys, raw shapes, dtypes, full sample counts, and canonical interface shapes. It reads metadata and one sample from each split. Under the default `official_lpan` profile, the Mobility counts must be exactly 20,000 training, 1,800 validation, and 9,000 test samples. The loader does not fit or apply an additional normalization transform; it consumes the upstream preprocessed tensors stored in the LPAN files.
 
 ### Data semantics
 
@@ -122,12 +126,13 @@ Yd = [Re(t1), Re(t2), Im(t1), Im(t2)]
 Hd = [Re(t1), ..., Re(t6), Im(t1), ..., Im(t6)]
 ```
 
-The corresponding command-line options remain configurable for other datasets, but should not be changed for the official LPAN files without an independently verified reason:
+These labels are enforced by the default `--semantic-profile official_lpan`; changing only a label cannot silently reinterpret the same raw columns. Use `--semantic-profile custom` only for a separately rearranged or regenerated dataset whose column meanings have been independently verified:
 
 ```bash
 --obs-ris-indices 0,8,16,...,248
 --complex-layout grouped
 --obs-times 0,1
+--semantic-profile custom
 ```
 
 ## Reproducing the experiments
@@ -145,8 +150,7 @@ python main.py ridge --domain mobility --max-train 512 --max-val 128
 
 Remove the `--max-*` limits for full experiments. Ridge regression reads the test split only when `--test` is supplied.
 
-> [!CAUTION]
-> The current linear spatial interpolation baseline operates along the flattened RIS index `0..255`. It is not a two-dimensional grid-aware interpolator and must not be described as physical 2D interpolation in the manuscript.
+Spatial interpolation is grid-aware and row-wise on the physical `16 x 16` RIS. A query uses observations from its own row only; linear mode interpolates between observed columns and applies nearest-value extension outside their range. Nearest mode also remains within the same row. It never interpolates across a flattened row boundary.
 
 ### Neural-model smoke tests
 
@@ -161,9 +165,9 @@ python main.py train --domain mobility --model phymeta_stgt --mode smoke
 
 Smoke mode uses 64 training samples, 16 validation samples, and one epoch. Its outputs are implementation checks, not reportable performance results.
 
-### Direct 32-to-256 LPAN-L baseline
+### LPAN-L-Direct baseline
 
-`lpan_l_direct` is an LPAN-L-derived comparison model adapted to this repository's task contract. It retains dilated residual processing and channel attention, but replaces the original progressive `32 -> 64 -> 128 -> 256` reconstruction with one direct `32 -> 256` resize-and-reconstruction stage. It returns only the final dense channel tensor, with shape `[B, 1, 256, 64, 2]` for quasi-static data and `[B, 6, 256, 64, 2]` for mobility data.
+`LPAN-L-Direct` (CLI key: `lpan_l_direct`) is an LPAN-L-derived comparison model adapted to this repository's task contract. It retains dilated residual processing and channel attention, but replaces the original progressive `32 -> 64 -> 128 -> 256` reconstruction with one direct `32 -> 256` resize-and-reconstruction stage. It accepts only the verified official input ordering `(0, 8, ..., 248)` and returns the final dense channel tensor, with shape `[B, 1, 256, 64, 2]` for quasi-static data and `[B, 6, 256, 64, 2]` for mobility data. The ambiguous `lpan_l` alias is intentionally unsupported.
 
 ```bash
 python main.py train --domain quasi --model lpan_l_direct --mode full \
@@ -216,11 +220,11 @@ Supported adaptation protocols are:
 |---|---|
 | Target-only training | omit `--pretrained` and use `--adaptation full` |
 | Full fine-tuning | `--adaptation full` |
-| Frozen spatial encoder | `--adaptation frozen_spatial` |
-| Domain adapter only | `--adaptation adapter_only` |
-| Selective temporal adaptation | `--adaptation selective` |
+| Frozen spatial encoder | `--adaptation frozen_spatial`: time path, domain adapter, and decoder |
+| Selective temporal adaptation | `--adaptation selective`: time path and domain adapter |
+| Domain adapter only | `--adaptation adapter_only`: domain embedding only |
 
-In the current implementation, `selective` and `frozen_spatial` expose the same trainable parameter set: the time encoder, temporal attention, temporal normalization, domain embedding, and decoder. They should not be reported as distinct adaptation methods unless the code is changed to differentiate them. `adapter_only` updates the temporal normalization, domain embedding, and decoder.
+The trainable sets are strictly nested: `adapter_only < selective < frozen_spatial < full`. Every run records the exact trainable parameter names, top-level modules, counts, and fraction in its metadata; use that artifact when describing an adaptation result.
 
 Recommended target fractions are `0.01`, `0.05`, `0.10`, `0.20`, and `1.0`. For a fixed seed, subsets are nested prefixes of one shuffled index manifest so that every smaller support set is contained in the larger sets.
 
@@ -258,7 +262,7 @@ python main.py profile --domain quasi --batch-size 1 --device cpu \
   --output runs/quasi_complexity.json
 ```
 
-The command writes both JSON and CSV and prints `parameters`, `GMACs`, and `GFLOPs`. The fixed convention is one FP32 forward pass with batch size one and `1 MAC = 2 FLOPs`; backward, bias, normalization, activation, softmax, indexing, and interpolation costs are excluded. Every training run also records the same canonical complexity profile in `results/final_result.json`.
+The command writes both JSON and CSV and prints `parameters`, `GMACs`, and `GFLOPs`. The fixed convention is one FP32 forward pass with batch size one and `1 MAC = 2 FLOPs`; backward, bias, normalization, activation, softmax, indexing, and all spatial/temporal interpolation paths are excluded. This includes sparse-to-dense expansion einsums and framework interpolation kernels for every model. Every training run also records the same canonical complexity profile in `results/final_result.json`.
 
 The checked-in same-condition tables and machine-readable outputs are in [`reports/complexity_summary.md`](reports/complexity_summary.md). For the mobility task, the current PhyMeta-STGT measures `188,360` parameters, `0.114 GMACs`, and `0.228 GFLOPs`; the separately profiled official progressive LPAN-L measures `1,112,904` parameters, `6.338 GMACs`, and `12.676 GFLOPs` under the identical convention.
 
@@ -266,20 +270,22 @@ Do not place THOP MACs, paper-reported FLOPs, and profiler FLOPs in one column w
 
 ### Controlled ablation study
 
-The `ablate` command runs the full model and one-factor variants under the same seed, data fraction, optimizer settings, and epoch budget. Available variants remove spatial cross-attention, graph refinement, temporal attention, the domain adapter, coordinate encoding, or individual auxiliary losses. Quasi-static studies automatically omit the inapplicable temporal-difference-loss ablation.
+The `ablate` command runs the full model and one-factor variants under the same seed, data fraction, optimizer settings, epoch budget, and Stage-B best hyperparameters. In full mode, `--best-result` is required and every variant automatically inherits `hidden`, graph layers, heads, dropout, learning rate, and weight decay from that validation-only search artifact. The spatial-attention ablation replaces that module with deterministic row-wise grid-aware interpolation; the temporal-attention ablation replaces it with deterministic linear temporal interpolation and nearest-value extension. Other variants remove graph refinement, the domain adapter, coordinate encoding, or individual auxiliary losses. Every result row stores both a stable variant ID and a publication-facing display name/replacement mechanism. Quasi-static studies automatically omit the inapplicable temporal-difference-loss ablation.
 
 ```bash
 python main.py ablate --domain mobility --mode full --epochs 100 \
+  --best-result runs/mobility_hparam_seed123/best_result.json \
   --study-name mobility_ablation_seed123
 
 python main.py ablate --domain mobility --mode full --epochs 100 \
+  --best-result runs/mobility_hparam_seed123/best_result.json \
   --variants none,no_spatial_cross_attention,no_graph,no_temporal_attention,\
 no_domain_adapter,no_coordinate_encoding,nmse_only,no_charbonnier_loss,\
 no_observation_loss,no_temporal_delta_loss \
   --study-name mobility_ablation_selected_seed123
 ```
 
-Each result is selected independently on validation NMSE. `summary.json` reports the dB change relative to the full model; final test evaluation should be run only after the ablation protocol and checkpoint-selection rule are frozen.
+Each result is selected independently on validation NMSE. `summary.json` records the inherited Stage-B artifact and hyperparameters and reports the dB change relative to the full model; final test evaluation should be run only after the ablation protocol and checkpoint-selection rule are frozen.
 
 ### Resume a run
 
@@ -289,20 +295,20 @@ python main.py train ... \
   --run-name <run>
 ```
 
-Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random states. Resume configuration is validated before training continues.
+Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random states. They are written to a temporary file and atomically replace the final checkpoint only after serialization succeeds. Resume configuration is validated before training continues. If `training_history.csv` is ahead of the selected checkpoint (for example, after an interrupted save), it is truncated to the matching checkpoint epoch and the repair is recorded in `recovery.log`; missing, duplicated, unordered, or irreconcilable history still fails loudly.
 
 ## Models and protocols included
 
 - LS coarse-channel interpolation;
 - empirical Ridge regression with validation-selected regularization;
-- direct single-stage LPAN-L-derived baseline (`lpan_l_direct`);
+- LPAN-L-Direct, the task-adapted single-stage baseline (`lpan_l_direct`);
 - EDSR-lite;
 - Spatial GCN;
 - CNN-GRU;
 - GCN-GRU; and
 - PhyMeta-STGT.
 
-`lpan_l_direct` is intentionally a task-adapted, single-stage LPAN-L-derived baseline and must not be labeled as an unchanged reproduction of the official progressive LPAN-L architecture.
+`LPAN-L-Direct` is intentionally a task-adapted, single-stage LPAN-L-derived baseline and must not be labeled as an unchanged reproduction of the official progressive LPAN-L architecture.
 The official progressive LPAN-L is not a registered training option in this repository. Its source implementation is handled only by the separate validated profiling script and external baseline pipeline.
 
 CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode positions `0..5`. They perform sequence-to-sequence reconstruction of the complete six-block frame, including the two pilot positions; they are not strict future-only predictors beginning at position 2.

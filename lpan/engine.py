@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -107,7 +108,7 @@ def train_balanced_joint_epoch(
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
-def configure_adaptation(model: nn.Module, policy: str) -> dict[str, int]:
+def configure_adaptation(model: nn.Module, policy: str) -> dict[str, object]:
     policy = policy.replace("-", "_")
     if policy != "full" and not hasattr(model, "domain_embedding"):
         raise ValueError(
@@ -124,11 +125,17 @@ def configure_adaptation(model: nn.Module, policy: str) -> dict[str, int]:
         for parameter in model.spatial_parameters():
             parameter.requires_grad = False
     elif policy in {"adapter_only", "selective"}:
-        adapter_tokens = ("domain_embedding", "decoder", "temporal_norm")
-        selective_tokens = adapter_tokens + ("time_encoder", "temporal_attention")
+        adapter_tokens = ("domain_embedding",)
+        selective_tokens = adapter_tokens + (
+            "time_encoder",
+            "temporal_attention",
+            "temporal_norm",
+        )
         allowed = adapter_tokens if policy == "adapter_only" else selective_tokens
         for name, parameter in model.named_parameters():
-            parameter.requires_grad = any(token in name for token in allowed)
+            parameter.requires_grad = any(
+                name == token or name.startswith(f"{token}.") for token in allowed
+            )
     else:
         raise ValueError(
             "policy must be full, frozen_spatial, adapter_only, or selective."
@@ -141,10 +148,17 @@ def configure_adaptation(model: nn.Module, policy: str) -> dict[str, int]:
     )
     if trainable == 0:
         raise ValueError(f"Adaptation policy {policy!r} selected no parameters.")
+    trainable_names = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
     return {
         "total_parameters": total,
         "trainable_parameters": trainable,
         "trainable_fraction": trainable / total,
+        "trainable_parameter_names": trainable_names,
+        "trainable_module_names": sorted(
+            {name.split(".", 1)[0] for name in trainable_names}
+        ),
     }
 
 
@@ -160,19 +174,23 @@ def save_checkpoint(
     metadata: dict[str, object],
     rng_state: dict[str, object] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "epoch": epoch,
-            "best_nmse": best_nmse,
-            "model_name": model_name,
-            "model_config": model_config,
-            "metadata": metadata,
-            "rng_state": rng_state,
-        },
-        path,
-    )
+    payload = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_nmse": best_nmse,
+        "model_name": model_name,
+        "model_config": model_config,
+        "metadata": metadata,
+        "rng_state": rng_state,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def capture_rng_state(

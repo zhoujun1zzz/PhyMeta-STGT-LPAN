@@ -16,7 +16,10 @@ from lpan.complexity import canonical_batch, profile_model_complexity
 from lpan.engine import (
     capture_rng_state,
     configure_adaptation,
+    read_history,
     restore_rng_state,
+    save_checkpoint,
+    write_history,
 )
 from lpan.metrics import MetricAccumulator
 from lpan.models import (
@@ -34,10 +37,13 @@ from lpan.paths import dataset_candidates, resolve_dataset_path
 from lpan.ridge import RidgeStatistics
 from lpan.studies import (
     ARCHITECTURE_ABLATIONS,
+    ablation_metadata,
     ablated_loss_weights,
     hyperparameter_candidates,
 )
 from main import (
+    _load_best_hyperparameters,
+    ablate_command,
     audit_command,
     main as cli_main,
     load_pretrained_checkpoint,
@@ -47,6 +53,7 @@ from main import (
     validate_training_request,
 )
 from lpan.graph import ris_index_to_grid
+from scripts.verify_data_semantics import verify_mobility
 
 
 def write_mat(path: Path, domain: str, samples: int = 3) -> None:
@@ -136,6 +143,7 @@ def test_interleaved_complex_layout(tmp_path: Path) -> None:
         "mobility",
         "validation",
         complex_layout="interleaved",
+        semantic_profile="custom",
     )[0]
     assert sample["obs_h"][0, 0, 0].tolist() == [10, 20]
     assert sample["obs_h"][1, 0, 0].tolist() == [30, 40]
@@ -174,6 +182,16 @@ def test_lpan_l_direct_is_single_stage_32_to_256() -> None:
     assert not any(isinstance(module, torch.nn.Upsample) for module in model.modules())
 
 
+def test_lpan_l_direct_rejects_nonofficial_geometry_and_ambiguous_alias() -> None:
+    model = build_model("lpan_l_direct", domain="mobility")
+    batch = collate_sample("mobility")
+    batch["obs_ris_index"] = torch.arange(1, 256, 8).unsqueeze(0)
+    with pytest.raises(ValueError, match="verified official LPAN ordering"):
+        model(batch)
+    with pytest.raises(ValueError, match="Unknown model"):
+        build_model("lpan_l", domain="mobility")
+
+
 def test_complexity_profile_uses_one_explicit_convention() -> None:
     batch = canonical_batch("mobility", batch_size=1)
     for name in ("lpan_l_direct", "phymeta_stgt"):
@@ -193,6 +211,24 @@ def test_complexity_profile_uses_one_explicit_convention() -> None:
         assert result["gflops"] == pytest.approx(2 * result["gmacs"])
         assert result["input_shape"] == [1, 2, 32, 64, 2]
         assert result["output_shape"] == [1, 6, 256, 64, 2]
+        assert result["interpolation_policy"].startswith("excluded in full")
+        assert "interpolation (all spatial and temporal paths)" in result[
+            "excluded_operations"
+        ]
+
+
+def test_complexity_excludes_interpolation_paths() -> None:
+    class InterpolationOnly(torch.nn.Module):
+        def forward(
+            self, batch: dict[str, torch.Tensor]
+        ) -> torch.Tensor:
+            return expand_observations_to_grid(batch)
+
+    result = profile_model_complexity(
+        InterpolationOnly(), canonical_batch("mobility", batch_size=1)
+    )
+    assert result["macs"] == 0
+    assert result["flops"] == 0
 
 
 def test_profile_cli_defaults_to_batch_one() -> None:
@@ -231,6 +267,10 @@ def test_phymeta_architecture_and_loss_ablations() -> None:
         base, "no_temporal_delta_loss", domain="mobility"
     )
     assert no_delta.delta == 0.0
+    spatial = ablation_metadata("no_spatial_cross_attention")
+    temporal = ablation_metadata("no_temporal_attention")
+    assert "row-wise grid-aware" in str(spatial["replacement_mechanism"])
+    assert "temporal interpolation" in str(temporal["replacement_mechanism"])
 
 
 def test_hyperparameter_search_plan_is_valid_and_deterministic() -> None:
@@ -265,9 +305,58 @@ def test_tune_and_ablate_cli_contracts() -> None:
             "mobility",
             "--variants",
             "none,no_graph,nmse_only",
+            "--best-result",
+            "runs/stage_b/best_result.json",
         ]
     )
     assert ablate.variants == ("none", "no_graph", "nmse_only")
+    assert ablate.best_result == Path("runs/stage_b/best_result.json")
+
+    missing_stage_b = experiment_parser().parse_args(
+        ["ablate", "--domain", "mobility", "--mode", "full"]
+    )
+    with pytest.raises(ValueError, match="requires --best-result"):
+        ablate_command(missing_stage_b)
+
+
+def test_ablation_loads_stage_b_best_hyperparameters(tmp_path: Path) -> None:
+    best_result = tmp_path / "best_result.json"
+    best_result.write_text(
+        __import__("json").dumps(
+            {
+                "status": "validation_search",
+                "domain": "mobility",
+                "best_hyperparameters": {
+                    "hidden": 48,
+                    "graph_layers": 3,
+                    "heads": 4,
+                    "dropout": 0.1,
+                    "learning_rate": 1e-4,
+                    "weight_decay": 1e-5,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _load_best_hyperparameters(
+        best_result,
+        expected_domain="mobility",
+        require_full_search=True,
+    )
+    assert config == {
+        "hidden": 48,
+        "graph_layers": 3,
+        "heads": 4,
+        "dropout": 0.1,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-5,
+    }
+    with pytest.raises(ValueError, match="does not match"):
+        _load_best_hyperparameters(
+            best_result,
+            expected_domain="quasi",
+            require_full_search=True,
+        )
 
 
 def test_backward_optimizer_and_future_gru_outputs() -> None:
@@ -302,6 +391,56 @@ def test_cnn_grid_expansion_respects_observed_indices() -> None:
     assert torch.equal(full.index_select(2, indices), batch["obs_h"])
 
 
+def test_grid_aware_interpolation_never_crosses_ris_rows() -> None:
+    batch = collate_sample("quasi")
+    obs = torch.zeros_like(batch["obs_h"])
+    for row in range(16):
+        obs[:, :, 2 * row] = float(100 * row)
+        obs[:, :, 2 * row + 1] = float(100 * row + 8)
+    batch["obs_h"] = obs
+    linear = expand_observations_to_grid(batch)
+    nearest = expand_observations_to_grid(batch, nearest=True)
+    assert linear.shape == nearest.shape == (1, 1, 256, 64, 2)
+    assert torch.isfinite(linear).all()
+    assert torch.isfinite(nearest).all()
+    assert torch.all(linear[:, :, 15] == 8.0)
+    assert torch.all(linear[:, :, 16] == 100.0)
+    assert torch.all(nearest[:, :, 15] == 8.0)
+    assert torch.all(nearest[:, :, 16] == 100.0)
+    batch["observation_mask"][:, :, 0] = False
+    masked = expand_observations_to_grid(batch)
+    assert torch.all(masked[:, :, :16] == 8.0)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "ablation"),
+    [
+        ("edsr_lite", "none"),
+        ("cnn_gru", "none"),
+        ("phymeta_stgt", "no_spatial_cross_attention"),
+    ],
+)
+def test_grid_dependent_models_support_backward(
+    model_name: str, ablation: str
+) -> None:
+    batch = collate_sample("mobility")
+    model = build_model(
+        model_name,
+        domain="mobility",
+        hidden=16,
+        graph_layers=1,
+        heads=4,
+        ablation=ablation,
+    )
+    prediction = model(batch)
+    loss, _ = combined_loss(prediction, batch, LossWeights())
+    loss.backward()
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+    )
+
+
 def test_adaptation_guards_and_parameter_freezing() -> None:
     validate_training_request("phymeta_stgt", "full", None, None)
     with pytest.raises(ValueError, match="pretrained checkpoint"):
@@ -311,15 +450,33 @@ def test_adaptation_guards_and_parameter_freezing() -> None:
     baseline = build_model("cnn_gru", domain="mobility", hidden=16)
     with pytest.raises(ValueError, match="only supported"):
         configure_adaptation(baseline, "adapter_only")
-    proposed = build_model(
-        "phymeta_stgt",
-        domain="mobility",
-        hidden=16,
-        graph_layers=1,
-        heads=4,
+    trainable_sets = {}
+    reports = {}
+    for policy in ("full", "frozen_spatial", "selective", "adapter_only"):
+        proposed = build_model(
+            "phymeta_stgt",
+            domain="mobility",
+            hidden=16,
+            graph_layers=1,
+            heads=4,
+        )
+        reports[policy] = configure_adaptation(proposed, policy)
+        expected_names = [
+            name
+            for name, parameter in proposed.named_parameters()
+            if parameter.requires_grad
+        ]
+        trainable_sets[policy] = set(expected_names)
+        assert reports[policy]["trainable_parameter_names"] == expected_names
+    assert (
+        trainable_sets["adapter_only"]
+        < trainable_sets["selective"]
+        < trainable_sets["frozen_spatial"]
+        < trainable_sets["full"]
     )
-    report = configure_adaptation(proposed, "selective")
-    assert 0 < report["trainable_parameters"] < report["total_parameters"]
+    assert reports["adapter_only"]["trainable_module_names"] == [
+        "domain_embedding"
+    ]
 
 
 def test_pretrained_checkpoint_requires_exact_phymeta_architecture() -> None:
@@ -388,12 +545,19 @@ def test_evaluation_semantics_inherit_reject_and_override() -> None:
         "obs_times": None,
         "obs_ris_indices": None,
         "complex_layout": None,
+        "semantic_profile": None,
         "allow_semantic_override": False,
     }
     resolved = resolve_evaluation_semantics(
         argparse.Namespace(**defaults), state
     )
-    assert resolved == ("mobility", (0, 1), saved_indices, "interleaved")
+    assert resolved == (
+        "mobility",
+        (0, 1),
+        saved_indices,
+        "interleaved",
+        "custom",
+    )
 
     conflicting = argparse.Namespace(**{**defaults, "complex_layout": "grouped"})
     with pytest.raises(ValueError, match="do not match checkpoint"):
@@ -416,6 +580,7 @@ def test_evaluate_cli_semantics_default_to_checkpoint() -> None:
     assert args.obs_times is None
     assert args.obs_ris_indices is None
     assert args.complex_layout is None
+    assert args.semantic_profile is None
     assert args.allow_semantic_override is False
 
 
@@ -485,6 +650,11 @@ def test_cli_resume_keeps_history_and_rng_state(
     run_dir = output_root / "resume_test"
     checkpoint = run_dir / "checkpoints" / "last_checkpoint.pth"
     original_command = (run_dir / "command.txt").read_text(encoding="utf-8")
+    history_path = run_dir / "results" / "training_history.csv"
+    history = read_history(history_path)
+    synthetic_ahead_row = dict(history[-1])
+    synthetic_ahead_row["epoch"] = 2
+    write_history(history_path, history + [synthetic_ahead_row])
 
     monkeypatch.setattr(
         sys,
@@ -510,6 +680,8 @@ def test_cli_resume_keeps_history_and_rng_state(
     assert len(
         (run_dir / "resume_commands.log").read_text(encoding="utf-8").splitlines()
     ) == 1
+    recovery = (run_dir / "recovery.log").read_text(encoding="utf-8")
+    assert "truncated training_history.csv from epoch 2 to checkpoint epoch 1" in recovery
 
 
 def test_auxiliary_losses_are_scale_normalized() -> None:
@@ -535,6 +707,31 @@ def test_auxiliary_losses_are_scale_normalized() -> None:
     )
 
 
+def test_observation_consistency_uses_mask_and_rejects_empty_sample() -> None:
+    batch = collate_sample("mobility")
+    prediction = batch["target_h"].clone()
+    ris = batch["obs_ris_index"][0]
+    times = batch["obs_time_index"][0]
+    prediction[:, times[0], ris[0]] = 1e6
+    batch["observation_mask"][:, 0, 0] = False
+    masked = observation_consistency(prediction, batch)
+    prediction[:, times[0], ris[0]] = -1e6
+    assert torch.equal(observation_consistency(prediction, batch), masked)
+
+    batch["observation_mask"].zero_()
+    with pytest.raises(ValueError, match="at least one valid observation"):
+        observation_consistency(prediction, batch)
+    model = build_model(
+        "phymeta_stgt",
+        domain="mobility",
+        hidden=16,
+        graph_layers=1,
+        heads=4,
+    )
+    with pytest.raises(ValueError, match="at least one valid observation token"):
+        model(batch)
+
+
 def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
     corrupt = dataset_candidates(tmp_path, "quasi", "train")[0]
     corrupt.parent.mkdir(parents=True)
@@ -548,6 +745,7 @@ def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
             "mobility_obs_times": (0, 1),
             "obs_ris_indices": tuple(range(0, 256, 8)),
             "complex_layout": "grouped",
+            "semantic_profile": "official_lpan",
             "output": str(output),
         },
     )()
@@ -558,6 +756,87 @@ def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
     assert entry["valid"] is False
     assert "Not an HDF5" in entry["error"]
     assert len(report["files"]) == 6
+
+
+def test_official_semantic_profile_and_audit_reject_wrong_evidence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mobility.mat"
+    write_mat(path, "mobility", samples=3)
+    with pytest.raises(ValueError, match="official_lpan semantic profile rejects"):
+        LPANH5Dataset(
+            path,
+            "mobility",
+            "validation",
+            complex_layout="interleaved",
+        )
+    with pytest.raises(ValueError, match="official_lpan semantic profile rejects"):
+        LPANH5Dataset(
+            path,
+            "mobility",
+            "validation",
+            obs_ris_index=tuple(range(1, 256, 8)),
+        )
+    with pytest.raises(ValueError, match="official_lpan semantic profile rejects"):
+        LPANH5Dataset(
+            path,
+            "mobility",
+            "validation",
+            obs_time_index=(1, 2),
+        )
+    custom = LPANH5Dataset(
+        path,
+        "mobility",
+        "validation",
+        obs_ris_index=tuple(range(1, 256, 8)),
+        obs_time_index=(1, 2),
+        complex_layout="interleaved",
+        semantic_profile="custom",
+    )
+    assert custom.semantic_profile == "custom"
+    custom.close()
+
+    candidate = dataset_candidates(tmp_path, "mobility", "validation")[0]
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    write_mat(candidate, "mobility", samples=3)
+    output = tmp_path / "audit.json"
+    args = argparse.Namespace(
+        data_root=str(tmp_path),
+        mobility_obs_times=(0, 1),
+        obs_ris_indices=tuple(range(0, 256, 8)),
+        complex_layout="grouped",
+        semantic_profile="official_lpan",
+        output=str(output),
+    )
+    audit_command(args)
+    report = __import__("json").loads(output.read_text(encoding="utf-8"))
+    entry = next(
+        row
+        for row in report["files"]
+        if row["domain"] == "mobility" and row["split"] == "validation"
+    )
+    assert entry["valid"] is False
+    assert entry["expected_total_samples"] == 1800
+    assert "expects 1800 samples, found 3" in entry["error"]
+
+
+def test_atomic_checkpoint_replaces_final_file(tmp_path: Path) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    path = tmp_path / "checkpoint.pth"
+    save_checkpoint(
+        path,
+        model,
+        optimizer,
+        epoch=4,
+        best_nmse=0.5,
+        model_name="unit",
+        model_config={},
+        metadata={},
+    )
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    assert state["epoch"] == 4
+    assert not path.with_name(f"{path.name}.tmp").exists()
 
 
 def test_per_snr_requires_explicit_total_size(tmp_path: Path) -> None:
@@ -606,3 +885,48 @@ def test_interpolation_metrics_and_ridge() -> None:
     ridge = statistics.solve(1e-3)
     ridge_prediction = ridge.predict(batch)
     assert ridge_prediction.shape == batch["target_h"].shape
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+def test_metric_accumulator_rejects_non_finite_samples(invalid: float) -> None:
+    batch = collate_sample("mobility")
+    prediction = torch.randn_like(batch["target_h"])
+    prediction[0, 0, 0, 0, 0] = invalid
+    metrics = MetricAccumulator()
+    with pytest.raises(FloatingPointError, match="non-finite"):
+        metrics.update(prediction, batch)
+    assert metrics.compute()["sample_count"] == 0
+
+
+def _encode_complex_layout(values: np.ndarray, layout: str) -> np.ndarray:
+    # [S,T,RIS,BS] -> [2T,RIS,BS,S]
+    samples, blocks, nodes, antennas = values.shape
+    if layout == "grouped":
+        channels = np.concatenate((values.real, values.imag), axis=1)
+    else:
+        channels = np.empty(
+            (samples, 2 * blocks, nodes, antennas), dtype=np.float64
+        )
+        channels[:, 0::2] = values.real
+        channels[:, 1::2] = values.imag
+    return channels.transpose(1, 2, 3, 0)
+
+
+@pytest.mark.parametrize("layout", ["grouped", "interleaved"])
+def test_mobility_layout_is_inferred_from_correlation_evidence(
+    tmp_path: Path, layout: str
+) -> None:
+    rng = np.random.default_rng(42)
+    target = rng.normal(size=(8, 6, 256, 64)) + 1j * rng.normal(
+        size=(8, 6, 256, 64)
+    )
+    observed = target[:, :2, np.arange(0, 256, 8)]
+    path = tmp_path / f"{layout}.mat"
+    with h5py.File(path, "w") as handle:
+        handle["Yd"] = _encode_complex_layout(observed, layout)
+        handle["Hd"] = _encode_complex_layout(target, layout)
+    result = verify_mobility(path, samples=8)
+    assert result["verified_layout"] == layout
+    assert result["layout_inference"]["status"] == "verified"
+    expected_second_channel = "Re(t2)" if layout == "grouped" else "Im(t1)"
+    assert result["raw_Yd_channels"][1] == expected_second_channel

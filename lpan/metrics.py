@@ -20,9 +20,24 @@ class MetricAccumulator:
         self.sums: defaultdict[str, float] = defaultdict(float)
         self.counts: defaultdict[str, int] = defaultdict(int)
 
+    @staticmethod
+    def _require_finite(key: str, values: torch.Tensor) -> torch.Tensor:
+        detached = values.detach()
+        finite_mask = torch.isfinite(detached)
+        if not bool(finite_mask.all()):
+            invalid = detached[~finite_mask]
+            nan_count = int(torch.isnan(invalid).sum().item())
+            positive_inf = int(torch.isposinf(invalid).sum().item())
+            negative_inf = int(torch.isneginf(invalid).sum().item())
+            raise FloatingPointError(
+                f"Metric input {key!r} contains non-finite values: "
+                f"NaN={nan_count}, +Inf={positive_inf}, -Inf={negative_inf}. "
+                "The batch was rejected; no samples were accumulated."
+            )
+        return detached
+
     def _add(self, key: str, values: torch.Tensor) -> None:
-        finite = values.detach().double().cpu()
-        finite = finite[torch.isfinite(finite)]
+        finite = self._require_finite(key, values).double().cpu()
         self.sums[key] += float(finite.sum())
         self.counts[key] += int(finite.numel())
 
@@ -32,6 +47,8 @@ class MetricAccumulator:
         batch: Mapping[str, torch.Tensor],
     ) -> None:
         target = batch["target_h"]
+        self._require_finite("prediction", prediction)
+        self._require_finite("target_h", target)
         self._add("overall", sample_nmse(prediction, target))
         for block in range(target.shape[1]):
             self._add(
