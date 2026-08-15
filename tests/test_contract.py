@@ -11,6 +11,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import main as experiment_main
+
 from lpan.data import LPANH5Dataset, default_observed_ris_indices
 from lpan.complexity import canonical_batch, profile_model_complexity
 from lpan.engine import (
@@ -45,11 +47,15 @@ from main import (
     _load_best_hyperparameters,
     ablate_command,
     audit_command,
+    early_stopping_progress,
+    early_stopping_step,
     main as cli_main,
     load_pretrained_checkpoint,
     parser as experiment_parser,
     per_snr_evaluation,
     resolve_evaluation_semantics,
+    select_fastest_batch,
+    tune_command,
     validate_training_request,
 )
 from lpan.graph import ris_index_to_grid
@@ -99,6 +105,15 @@ def test_hdf5_contract(tmp_path: Path) -> None:
         sample = dataset[0]
         assert tuple(sample["obs_h"].shape) == expected[0]
         assert tuple(sample["target_h"].shape) == expected[1]
+
+
+def test_partially_constructed_dataset_can_close_without_warning(
+    tmp_path: Path,
+) -> None:
+    dataset = LPANH5Dataset.__new__(LPANH5Dataset)
+    with pytest.raises(ValueError, match="domain must be one of"):
+        dataset.__init__(tmp_path / "missing.mat", "invalid", "train")
+    dataset.close()
 
 
 def test_verified_lpan_ris_mapping() -> None:
@@ -273,6 +288,31 @@ def test_phymeta_architecture_and_loss_ablations() -> None:
     assert "temporal interpolation" in str(temporal["replacement_mechanism"])
 
 
+def test_phymeta_attention_disables_unused_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = build_model(
+        "phymeta_stgt",
+        domain="mobility",
+        hidden=16,
+        graph_layers=1,
+        heads=4,
+    )
+    calls: list[bool | None] = []
+    for attention in (model.spatial_cross_attention, model.temporal_attention):
+        assert attention is not None
+        original = attention.forward
+
+        def wrapped(*args, _original=original, **kwargs):
+            calls.append(kwargs.get("need_weights"))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(attention, "forward", wrapped)
+    prediction = model(collate_sample("mobility"))
+    assert torch.isfinite(prediction).all()
+    assert calls == [False, False]
+
+
 def test_hyperparameter_search_plan_is_valid_and_deterministic() -> None:
     values = {
         "hidden_values": (16, 18),
@@ -298,6 +338,13 @@ def test_tune_and_ablate_cli_contracts() -> None:
     )
     assert tune.model == "phymeta_stgt"
     assert tune.max_trials == 2
+    assert tune.round1_epochs == 25
+    assert tune.promote_top_k == 3
+    assert tune.batch_size == 32
+    assert tune.eval_batch_size == 64
+    assert tune.workers == 8
+    assert tune.min_epochs == 40
+    assert tune.patience == 15
     ablate = experiment_parser().parse_args(
         [
             "ablate",
@@ -317,6 +364,106 @@ def test_tune_and_ablate_cli_contracts() -> None:
     )
     with pytest.raises(ValueError, match="requires --best-result"):
         ablate_command(missing_stage_b)
+
+
+def test_early_stopping_starts_patience_after_minimum_epoch() -> None:
+    best = float("inf")
+    stale = 0
+    stopped_at = None
+    for epoch in range(1, 80):
+        value = 1.0 if epoch == 1 else 2.0
+        best, stale, improved, should_stop = early_stopping_step(
+            best_nmse=best,
+            stale_epochs=stale,
+            validation_nmse=value,
+            epoch=epoch,
+            enabled=True,
+            min_epochs=40,
+            patience=15,
+        )
+        assert improved is (epoch == 1)
+        if should_stop:
+            stopped_at = epoch
+            break
+    assert stopped_at == 55
+    history = [
+        {"epoch": epoch, "validation_nmse_linear": 1.0 if epoch == 1 else 2.0}
+        for epoch in range(1, 56)
+    ]
+    assert early_stopping_progress(history, min_epochs=40) == (1.0, 15)
+
+
+def test_select_fastest_batch_rejects_oom_rows() -> None:
+    selected = select_fastest_batch(
+        [
+            {"batch_size": 16, "status": "completed", "samples_per_second": 10.0},
+            {"batch_size": 32, "status": "completed", "samples_per_second": 20.0},
+            {"batch_size": 64, "status": "oom"},
+        ]
+    )
+    assert selected["batch_size"] == 32
+
+
+def test_tune_promotes_top_trial_from_last_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[argparse.Namespace] = []
+
+    def fake_train(args: argparse.Namespace) -> dict[str, object]:
+        calls.append(args)
+        if args.resume:
+            run_dir = Path(args.resume).parent.parent
+            metric = 0.05
+        else:
+            run_dir = Path(args.output_root) / args.run_name
+            metric = 0.2 if args.run_name == "trial_000" else 0.1
+        checkpoints = run_dir / "checkpoints"
+        checkpoints.mkdir(parents=True, exist_ok=True)
+        (checkpoints / "last_checkpoint.pth").touch()
+        (checkpoints / "best_checkpoint.pth").touch()
+        return {
+            "run_dir": str(run_dir),
+            "result": {
+                "best_validation_nmse_linear": metric,
+                "best_validation_nmse_db": 10 * np.log10(metric),
+                "epochs_completed": args.epochs,
+                "stopped_early": False,
+            },
+        }
+
+    monkeypatch.setattr(experiment_main, "train_command", fake_train)
+    args = experiment_parser().parse_args(
+        [
+            "tune",
+            "--domain",
+            "mobility",
+            "--mode",
+            "full",
+            "--max-trials",
+            "2",
+            "--round1-epochs",
+            "2",
+            "--promote-top-k",
+            "1",
+            "--epochs",
+            "5",
+            "--study-name",
+            "promotion_test",
+            "--output-root",
+            str(tmp_path),
+        ]
+    )
+    result = tune_command(args)
+    assert len(calls) == 3
+    assert calls[0].epochs == calls[1].epochs == 2
+    assert calls[0].resume is None and calls[1].resume is None
+    assert calls[2].epochs == 5
+    assert Path(calls[2].resume).name == "last_checkpoint.pth"
+    assert calls[2].run_name == "trial_001"
+    assert result["round1_completed_trials"] == 2
+    assert result["promoted_completed_trials"] == 1
+    assert result["best_trial"]["trial"] == 1
 
 
 def test_ablation_loads_stage_b_best_hyperparameters(tmp_path: Path) -> None:

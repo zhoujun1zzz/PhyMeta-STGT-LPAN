@@ -181,10 +181,12 @@ python main.py train --domain mobility --model lpan_l_direct --mode full \
 
 ```bash
 python main.py train --domain quasi --model phymeta_stgt --mode full \
-  --epochs 100 --batch-size 8 --run-name quasi_stgt_seed123
+  --epochs 100 --batch-size 32 --eval-batch-size 64 --workers 8 \
+  --min-epochs 40 --patience 15 --run-name quasi_stgt_seed123
 
 python main.py train --domain mobility --model phymeta_stgt --mode full \
-  --epochs 100 --batch-size 2 --run-name mobility_stgt_seed123
+  --epochs 100 --batch-size 32 --eval-batch-size 64 --workers 8 \
+  --min-epochs 40 --patience 15 --run-name mobility_stgt_seed123
 
 python main.py evaluate \
   --checkpoint runs/mobility_stgt_seed123/checkpoints/best_checkpoint.pth \
@@ -194,7 +196,7 @@ python main.py evaluate \
 
 Training uses only the official training and validation splits. Test evaluation is a separate command. By default, evaluation inherits the domain, pilot times, observed RIS indices, and complex layout from the checkpoint; conflicting explicit settings are rejected unless `--allow-semantic-override` is intentionally supplied.
 
-### Balanced joint training
+### Optional balanced joint training
 
 ```bash
 python main.py joint --mode smoke
@@ -202,6 +204,8 @@ python main.py joint --mode full --epochs 100 --run-name joint_stgt_seed123
 ```
 
 Joint training alternates task-homogeneous mini-batches at approximately equal task frequency. It does not replicate quasi-static labels across six artificial time blocks.
+
+Joint training is not part of the frozen fast formal protocol. It remains optional until its resume/recovery path is brought to the same standard as single-domain training and the manuscript explicitly requires the result.
 
 ### Parameter-efficient transfer
 
@@ -232,11 +236,14 @@ The `--pretrained` option accepts only a structurally compatible PhyMeta-STGT ch
 
 ### Hyperparameter search
 
-The `tune` command performs a deterministic grid or seeded random search using only the training and validation splits. Every trial uses the same data subset and training seed, saves a complete run directory, and is ranked by the minimum sample-level linear validation NMSE. The test split is never read by this command.
+The `tune` command performs deterministic two-round multi-fidelity search using only the training and validation splits. In the formal protocol, all 12 seeded-random candidates train for 25 epochs, are ranked by their minimum sample-level linear validation NMSE, and the top three resume from their exact epoch-25 checkpoints to a maximum of 100 epochs. Checkpoint and DataLoader RNG states are preserved during promotion. This reduces the nominal per-domain budget from 1,200 to 525 epochs before early stopping. The test split is never read by this command.
 
 ```bash
 python main.py tune --domain mobility --mode full \
-  --strategy random --max-trials 12 --epochs 100 \
+  --strategy random --max-trials 12 --search-seed 2026 \
+  --round1-epochs 25 --promote-top-k 3 --epochs 100 \
+  --batch-size 32 --eval-batch-size 64 --workers 8 \
+  --min-epochs 40 --patience 15 \
   --hidden-values 48,64,96 \
   --graph-layer-values 1,2,3 \
   --head-values 4,8 \
@@ -246,7 +253,13 @@ python main.py tune --domain mobility --mode full \
   --study-name mobility_hparam_seed123
 ```
 
-The selected configuration and checkpoint are written to `runs/<study_name>/best_result.json`; all attempted configurations remain in `trials.csv` and `trials.json`. A smoke search verifies the pipeline but is not a reportable optimum.
+The selected configuration and checkpoint are written to `runs/<study_name>/best_result.json`; `search_plan.json`, `trials.csv`, and `trials.json` retain the round-1 ranking, promotion decisions, resume paths, and final ranking. A smoke search verifies only the round-1 plumbing and is not a reportable optimum.
+
+### Frozen batch and early-stopping protocol
+
+Formal Mobility training uses batch size 32, evaluation batch size 64, eight DataLoader workers, FP32, `OMP_NUM_THREADS=1`, and `MKL_NUM_THREADS=1`. Quasi-static training selects one batch size from `16,32,64,128` using a non-reportable 1,024-sample throughput benchmark; the fastest configuration that does not OOM is frozen for all subsequent Quasi runs.
+
+Every independently trainable neural model—including PhyMeta-STGT, LPAN-L-Direct, and all trainable baselines—uses the same validation-only stopping rule: at most 100 epochs, at least 40 epochs, and patience 15 after the minimum epoch. The test split never participates. Runs retain the best checkpoint even when training stops early. Disable the rule only for an intentional diagnostic with `--no-early-stopping`.
 
 ### Parameters, GMACs, and GFLOPs
 
@@ -286,6 +299,21 @@ no_observation_loss,no_temporal_delta_loss \
 ```
 
 Each result is selected independently on validation NMSE. `summary.json` records the inherited Stage-B artifact and hyperparameters and reports the dB change relative to the full model; final test evaluation should be run only after the ablation protocol and checkpoint-selection rule are frozen.
+
+### Automated fast formal pipeline
+
+The complete FP32 protocol is orchestrated by [`scripts/run_fast_formal_protocol.py`](scripts/run_fast_formal_protocol.py). It benchmarks the Quasi batch size, runs validation-only Stage A, executes two-round Stage B for both domains, runs three-seed PhyMeta and baseline studies, executes the Mobility ablations, freezes a checkpoint manifest, and only then opens the independent test split in Stage F. Each step has a separate log and an entry in `pipeline_state.json`; a failed command stops the pipeline without deleting completed artifacts.
+
+```bash
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+mkdir -p runs/formal_fast/logs
+nohup python -u scripts/run_fast_formal_protocol.py \
+  --data-root /path/to/data \
+  > runs/formal_fast/logs/formal_pipeline.log 2>&1 &
+```
+
+Do not reuse one pipeline output directory across different commits. Audit and semantic verification are intentionally not repeated by this script because they must already have passed before formal execution. The frozen details and server acceptance checks are documented in [`docs/fast_formal_protocol.md`](docs/fast_formal_protocol.md).
 
 ### Resume a run
 

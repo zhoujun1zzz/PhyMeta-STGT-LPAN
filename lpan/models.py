@@ -649,6 +649,7 @@ class PhyMetaSTGT(nn.Module):
                 observed,
                 observed,
                 key_padding_mask=~observation_mask,
+                need_weights=False,
             )
         x = x.reshape(b, t, 256, self.hidden)
         for layer in self.graph_layers:
@@ -675,7 +676,12 @@ class PhyMetaSTGT(nn.Module):
         else:
             memory = spatial.permute(0, 2, 1, 3).reshape(b * n, t, h)
             memory = memory + obs_pos.unsqueeze(0)
-            temporal, _ = self.temporal_attention(query, memory, memory)
+            temporal, _ = self.temporal_attention(
+                query,
+                memory,
+                memory,
+                need_weights=False,
+            )
             temporal = self.temporal_norm(temporal + query)
             q = temporal.shape[1]
         temporal = temporal.reshape(b, n, q, h)
