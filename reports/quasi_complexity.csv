@@ -1,0 +1,5 @@
+﻿model,total_parameters,trainable_parameters,gmacs,gflops,batch_size,input_shape,output_shape,dtype
+lpan_l_direct,658602,658602,2.48260608,4.96521216,1,"[1, 1, 32, 64, 2]","[1, 1, 256, 64, 2]",float32
+edsr_lite,297794,297794,4.87063552,9.74127104,1,"[1, 1, 32, 64, 2]","[1, 1, 256, 64, 2]",float32
+spatial_gcn,25344,25344,0.006496256,0.012992512,1,"[1, 1, 32, 64, 2]","[1, 1, 256, 64, 2]",float32
+phymeta_stgt,188360,188360,0.040255616,0.080511232,1,"[1, 1, 32, 64, 2]","[1, 1, 256, 64, 2]",float32

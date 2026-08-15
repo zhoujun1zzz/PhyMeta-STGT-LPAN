@@ -27,7 +27,12 @@ SPECS = {
 
 
 def default_observed_ris_indices() -> tuple[int, ...]:
-    """LPAN 32-pilot pattern: one observed element per consecutive group of 8."""
+    """Return the verified LPAN 32-pilot linear indices (zero based).
+
+    The LPAN paper defines the one-based subset as
+    ``{1, 1 + Gamma, ..., 1 + (P - 1) * Gamma}``.  Here ``P=32`` and
+    ``Gamma=8``, so the stored Yd columns map to ``0, 8, ..., 248``.
+    """
     return tuple(range(0, 256, 8))
 
 
@@ -42,6 +47,8 @@ class LPANH5Dataset(Dataset):
         *,
         obs_ris_index: Sequence[int] | None = None,
         obs_time_index: Sequence[int] | None = None,
+        # Official LPAN mobility files store all real time blocks first,
+        # followed by all imaginary time blocks.
         complex_layout: str = "grouped",
         max_samples: int | None = None,
         fraction: float = 1.0,

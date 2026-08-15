@@ -11,7 +11,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from lpan.data import LPANH5Dataset
+from lpan.data import LPANH5Dataset, default_observed_ris_indices
+from lpan.complexity import canonical_batch, profile_model_complexity
 from lpan.engine import (
     capture_rng_state,
     configure_adaptation,
@@ -31,6 +32,11 @@ from lpan.objectives import (
 )
 from lpan.paths import dataset_candidates, resolve_dataset_path
 from lpan.ridge import RidgeStatistics
+from lpan.studies import (
+    ARCHITECTURE_ABLATIONS,
+    ablated_loss_weights,
+    hyperparameter_candidates,
+)
 from main import (
     audit_command,
     main as cli_main,
@@ -40,6 +46,7 @@ from main import (
     resolve_evaluation_semantics,
     validate_training_request,
 )
+from lpan.graph import ris_index_to_grid
 
 
 def write_mat(path: Path, domain: str, samples: int = 3) -> None:
@@ -87,6 +94,15 @@ def test_hdf5_contract(tmp_path: Path) -> None:
         assert tuple(sample["target_h"].shape) == expected[1]
 
 
+def test_verified_lpan_ris_mapping() -> None:
+    indices = default_observed_ris_indices()
+    assert indices == tuple(range(0, 256, 8))
+    coordinates = [ris_index_to_grid(index) for index in indices]
+    assert coordinates == [
+        (row, col) for row in range(16) for col in (0, 8)
+    ]
+
+
 def test_portable_data_root_resolution(tmp_path: Path) -> None:
     candidate = dataset_candidates(tmp_path, "quasi", "validation")[0]
     candidate.parent.mkdir(parents=True)
@@ -131,6 +147,7 @@ def test_all_model_shapes_and_losses() -> None:
     for domain in ("quasi", "mobility"):
         batch = collate_sample(domain)
         for name in (
+            "lpan_l_direct",
             "edsr_lite",
             "spatial_gcn",
             "cnn_gru",
@@ -146,6 +163,111 @@ def test_all_model_shapes_and_losses() -> None:
             loss, parts = combined_loss(prediction, batch, LossWeights())
             assert torch.isfinite(loss)
             assert all(np.isfinite(value) for value in parts.values())
+
+
+def test_lpan_l_direct_is_single_stage_32_to_256() -> None:
+    model = build_model("lpan_l_direct", domain="mobility")
+    batch = collate_sample("mobility")
+    prediction = model(batch)
+    assert prediction.shape == (1, 6, 256, 64, 2)
+    assert model.target_nodes == 256
+    assert not any(isinstance(module, torch.nn.Upsample) for module in model.modules())
+
+
+def test_complexity_profile_uses_one_explicit_convention() -> None:
+    batch = canonical_batch("mobility", batch_size=1)
+    for name in ("lpan_l_direct", "phymeta_stgt"):
+        model = build_model(
+            name,
+            domain="mobility",
+            hidden=16,
+            graph_layers=1,
+            heads=4,
+        )
+        result = profile_model_complexity(model, batch)
+        assert result["total_parameters"] == sum(
+            parameter.numel() for parameter in model.parameters()
+        )
+        assert result["macs"] > 0
+        assert result["flops"] == 2 * result["macs"]
+        assert result["gflops"] == pytest.approx(2 * result["gmacs"])
+        assert result["input_shape"] == [1, 2, 32, 64, 2]
+        assert result["output_shape"] == [1, 6, 256, 64, 2]
+
+
+def test_profile_cli_defaults_to_batch_one() -> None:
+    args = experiment_parser().parse_args(
+        [
+            "profile",
+            "--domain",
+            "mobility",
+            "--models",
+            "lpan_l_direct,phymeta_stgt",
+        ]
+    )
+    assert args.batch_size == 1
+    assert args.device == "cpu"
+    assert args.models == ("lpan_l_direct", "phymeta_stgt")
+
+
+def test_phymeta_architecture_and_loss_ablations() -> None:
+    batch = collate_sample("mobility")
+    for variant in ARCHITECTURE_ABLATIONS:
+        model = build_model(
+            "phymeta_stgt",
+            domain="mobility",
+            hidden=16,
+            graph_layers=1,
+            heads=4,
+            ablation=variant,
+        )
+        prediction = model(batch)
+        assert prediction.shape == batch["target_h"].shape, variant
+        assert torch.isfinite(prediction).all(), variant
+    base = LossWeights(1.0, 0.1, 0.2, 0.3)
+    nmse_only = ablated_loss_weights(base, "nmse_only", domain="mobility")
+    assert nmse_only == LossWeights(1.0, 0.0, 0.0, 0.0)
+    no_delta = ablated_loss_weights(
+        base, "no_temporal_delta_loss", domain="mobility"
+    )
+    assert no_delta.delta == 0.0
+
+
+def test_hyperparameter_search_plan_is_valid_and_deterministic() -> None:
+    values = {
+        "hidden_values": (16, 18),
+        "graph_layer_values": (1, 2),
+        "head_values": (4,),
+        "dropout_values": (0.0, 0.1),
+        "learning_rate_values": (1e-4, 2e-4),
+        "weight_decay_values": (0.0,),
+        "strategy": "random",
+        "max_trials": 3,
+        "seed": 9,
+    }
+    first = hyperparameter_candidates(**values)
+    second = hyperparameter_candidates(**values)
+    assert first == second
+    assert len(first) == 3
+    assert all(item["hidden"] % item["heads"] == 0 for item in first)
+
+
+def test_tune_and_ablate_cli_contracts() -> None:
+    tune = experiment_parser().parse_args(
+        ["tune", "--domain", "mobility", "--max-trials", "2"]
+    )
+    assert tune.model == "phymeta_stgt"
+    assert tune.max_trials == 2
+    ablate = experiment_parser().parse_args(
+        [
+            "ablate",
+            "--domain",
+            "mobility",
+            "--variants",
+            "none,no_graph,nmse_only",
+        ]
+    )
+    assert ablate.variants == ("none", "no_graph", "nmse_only")
 
 
 def test_backward_optimizer_and_future_gru_outputs() -> None:

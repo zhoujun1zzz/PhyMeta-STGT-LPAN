@@ -1,0 +1,230 @@
+{
+  "domain": "mobility",
+  "device": "cpu",
+  "shared_conditions": {
+    "batch_size": 1,
+    "input_shape": [
+      1,
+      2,
+      32,
+      64,
+      2
+    ],
+    "dtype": "float32",
+    "pass": "forward only",
+    "test_data_read": false,
+    "mac_flop_conversion": "1 MAC = 2 FLOPs"
+  },
+  "results": [
+    {
+      "model": "lpan_l_direct",
+      "total_parameters": 669396,
+      "trainable_parameters": 669396,
+      "macs": 2634190848,
+      "gmacs": 2.634190848,
+      "flops": 5268381696,
+      "gflops": 5.268381696,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    },
+    {
+      "model": "edsr_lite",
+      "total_parameters": 304716,
+      "trainable_parameters": 304716,
+      "macs": 4984930304,
+      "gmacs": 4.984930304,
+      "flops": 9969860608,
+      "gflops": 9.969860608,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    },
+    {
+      "model": "spatial_gcn",
+      "total_parameters": 25344,
+      "trainable_parameters": 25344,
+      "macs": 21381120,
+      "gmacs": 0.02138112,
+      "flops": 42762240,
+      "gflops": 0.04276224,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    },
+    {
+      "model": "cnn_gru",
+      "total_parameters": 32962,
+      "trainable_parameters": 32962,
+      "macs": 1436555456,
+      "gmacs": 1.436555456,
+      "flops": 2873110912,
+      "gflops": 2.873110912,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    },
+    {
+      "model": "gcn_gru",
+      "total_parameters": 79552,
+      "trainable_parameters": 79552,
+      "macs": 71737728,
+      "gmacs": 0.071737728,
+      "flops": 143475456,
+      "gflops": 0.143475456,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    },
+    {
+      "model": "phymeta_stgt",
+      "total_parameters": 188360,
+      "trainable_parameters": 188360,
+      "macs": 113828352,
+      "gmacs": 0.113828352,
+      "flops": 227656704,
+      "gflops": 0.227656704,
+      "batch_size": 1,
+      "input_shape": [
+        1,
+        2,
+        32,
+        64,
+        2
+      ],
+      "output_shape": [
+        1,
+        6,
+        256,
+        64,
+        2
+      ],
+      "dtype": "float32",
+      "scope": "single forward pass; model operations only; no backward",
+      "convention": "1 MAC = 2 FLOPs",
+      "excluded_operations": [
+        "bias",
+        "normalization",
+        "activation",
+        "softmax",
+        "indexing",
+        "interpolation"
+      ]
+    }
+  ]
+}

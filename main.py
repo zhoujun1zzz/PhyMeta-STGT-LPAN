@@ -7,6 +7,7 @@ import random
 import shlex
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import h5py
@@ -14,6 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from lpan.complexity import canonical_batch, profile_model_complexity
 from lpan.data import LPANH5Dataset
 from lpan.engine import (
     capture_rng_state,
@@ -38,6 +40,13 @@ from lpan.paths import (
     resolve_dataset_path,
 )
 from lpan.ridge import EmpiricalRidge, RidgeStatistics
+from lpan.studies import (
+    ABLATION_VARIANTS,
+    ARCHITECTURE_ABLATIONS,
+    ablated_loss_weights,
+    architectural_ablation,
+    hyperparameter_candidates,
+)
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -50,6 +59,10 @@ def ints(value: str) -> tuple[int, ...]:
 
 def floats(value: str) -> tuple[float, ...]:
     return tuple(float(part.strip()) for part in value.split(",") if part.strip())
+
+
+def strings(value: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
 def path_for(
@@ -108,14 +121,26 @@ def device_from(value: str) -> torch.device:
     return torch.device(value)
 
 
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def model_config(args: argparse.Namespace, domain: str) -> dict[str, object]:
-    return {
+    config: dict[str, object] = {
         "domain": domain,
         "hidden": args.hidden,
         "graph_layers": args.graph_layers,
         "heads": args.heads,
         "dropout": args.dropout,
     }
+    ablation = architectural_ablation(getattr(args, "ablation", "none"))
+    if ablation != "none":
+        config["ablation"] = ablation
+    return config
 
 
 def model_parameter_report(model: torch.nn.Module) -> dict[str, float | int]:
@@ -214,11 +239,82 @@ def audit_command(args: argparse.Namespace) -> None:
     print(f"Audit written to {output}")
 
 
+def profile_command(args: argparse.Namespace) -> dict[str, object]:
+    """Report parameters and operation counts under one shared input contract."""
+
+    if len(set(args.models)) != len(args.models):
+        raise ValueError("--models must not contain duplicates.")
+    device = device_from(args.device)
+    batch = canonical_batch(
+        args.domain, batch_size=args.batch_size, device=device
+    )
+    config = model_config(args, args.domain)
+    rows: list[dict[str, object]] = []
+    for name in args.models:
+        if args.ablation != "none" and name != "phymeta_stgt":
+            raise ValueError(
+                "--ablation can only be used when profiling phymeta_stgt."
+            )
+        model = build_model(name, **config).to(device)
+        profile = profile_model_complexity(model, batch)
+        rows.append({"model": name, **profile})
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    report = {
+        "domain": args.domain,
+        "device": str(device),
+        "shared_conditions": {
+            "batch_size": args.batch_size,
+            "input_shape": list(batch["obs_h"].shape),
+            "dtype": "float32",
+            "pass": "forward only",
+            "test_data_read": False,
+            "mac_flop_conversion": "1 MAC = 2 FLOPs",
+        },
+        "results": rows,
+    }
+    output = Path(args.output)
+    write_json(output, report)
+    csv_output = output.with_suffix(".csv")
+    with csv_output.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "model",
+                "total_parameters",
+                "trainable_parameters",
+                "gmacs",
+                "gflops",
+                "batch_size",
+                "input_shape",
+                "output_shape",
+                "dtype",
+            ),
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    print(
+        f"{'model':28s} {'parameters':>14s} {'GMACs':>12s} {'GFLOPs':>12s}"
+    )
+    for row in rows:
+        print(
+            f"{str(row['model']):28s} "
+            f"{int(row['total_parameters']):14,d} "
+            f"{float(row['gmacs']):12.6f} "
+            f"{float(row['gflops']):12.6f}"
+        )
+    print(f"Complexity report written to {output} and {csv_output}")
+    return report
+
+
 def validate_training_request(
     model_name: str,
     adaptation: str,
     pretrained: str | None,
     resume: str | None,
+    ablation: str = "none",
 ) -> None:
     if pretrained and resume:
         raise ValueError("--pretrained and --resume cannot be used together.")
@@ -235,6 +331,10 @@ def validate_training_request(
             "Non-full adaptation requires a pretrained checkpoint. "
             "Use --adaptation full for scratch training."
         )
+    if ablation != "none" and model_name != "phymeta_stgt":
+        raise ValueError("Ablations are only supported for phymeta_stgt.")
+    if ablation != "none" and adaptation != "full":
+        raise ValueError("Ablation runs require --adaptation full.")
 
 
 def load_pretrained_checkpoint(
@@ -251,14 +351,15 @@ def load_pretrained_checkpoint(
     saved_config = state.get("model_config")
     if not isinstance(saved_config, dict):
         raise ValueError("Pretrained checkpoint is missing model_config.")
-    architecture_keys = ("hidden", "graph_layers", "heads")
+    architecture_keys = ("hidden", "graph_layers", "heads", "ablation")
     mismatches = {
         key: {
-            "checkpoint": saved_config.get(key),
-            "current": current_config.get(key),
+            "checkpoint": saved_config.get(key, "none" if key == "ablation" else None),
+            "current": current_config.get(key, "none" if key == "ablation" else None),
         }
         for key in architecture_keys
-        if saved_config.get(key) != current_config.get(key)
+        if saved_config.get(key, "none" if key == "ablation" else None)
+        != current_config.get(key, "none" if key == "ablation" else None)
     }
     if mismatches:
         raise ValueError(
@@ -288,9 +389,13 @@ def load_pretrained_checkpoint(
     }
 
 
-def train_command(args: argparse.Namespace) -> None:
+def train_command(args: argparse.Namespace) -> dict[str, object]:
     validate_training_request(
-        args.model, args.adaptation, args.pretrained, args.resume
+        args.model,
+        args.adaptation,
+        args.pretrained,
+        args.resume,
+        getattr(args, "ablation", "none"),
     )
 
     domain = args.domain
@@ -367,16 +472,18 @@ def train_command(args: argparse.Namespace) -> None:
     results = run_dir / "results"
     checkpoints.mkdir(parents=True, exist_ok=True)
     results.mkdir(parents=True, exist_ok=True)
-    command = shlex.join(sys.argv)
+    command = getattr(args, "command_override", shlex.join(sys.argv))
     if not args.resume:
         (run_dir / "command.txt").write_text(command, encoding="utf-8")
 
-    weights = LossWeights(
+    base_weights = LossWeights(
         args.nmse_weight,
         args.char_weight,
         args.obs_weight,
         args.delta_weight if domain == "mobility" else 0.0,
     )
+    ablation = getattr(args, "ablation", "none")
+    weights = ablated_loss_weights(base_weights, ablation, domain=domain)
     metadata = {
         "domain": domain,
         "mode": args.mode,
@@ -386,6 +493,8 @@ def train_command(args: argparse.Namespace) -> None:
         "complex_layout": args.complex_layout,
         "train_fraction": args.fraction,
         "adaptation": args.adaptation,
+        "ablation": ablation,
+        "architectural_ablation": architectural_ablation(ablation),
         "adaptation_parameters": adaptation,
         "pretrained": pretrained_metadata,
         "train_path": str(train_loader.dataset.path),
@@ -435,6 +544,10 @@ def train_command(args: argparse.Namespace) -> None:
             "adaptation": (
                 saved_metadata.get("adaptation"),
                 metadata["adaptation"],
+            ),
+            "ablation": (
+                saved_metadata.get("ablation", "none"),
+                metadata["ablation"],
             ),
             "train_path": (
                 saved_metadata.get("train_path"),
@@ -579,6 +692,9 @@ def train_command(args: argparse.Namespace) -> None:
             f"epoch={epoch} train={train_result['total']:.6g} "
             f"val={row['validation_nmse_db']:.4f} dB"
         )
+    complexity = profile_model_complexity(
+        model, canonical_batch(domain, batch_size=1, device=device)
+    )
     final = {
         "status": "smoke_test" if smoke else "validation",
         "best_validation_nmse_linear": best_nmse,
@@ -586,9 +702,256 @@ def train_command(args: argparse.Namespace) -> None:
         "history": history,
         "metadata": metadata,
         "parameters": model_parameter_report(model),
+        "complexity": complexity,
     }
     write_json(results / "final_result.json", final)
     print(f"Run completed: {run_dir}")
+    return {"run_dir": str(run_dir), "result": final}
+
+
+def _write_study_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _study_trial_args(
+    args: argparse.Namespace,
+    study_dir: Path,
+    run_name: str,
+    **overrides: object,
+) -> argparse.Namespace:
+    values = dict(vars(args))
+    values.update(
+        {
+            "model": "phymeta_stgt",
+            "adaptation": "full",
+            "pretrained": None,
+            "resume": None,
+            "run_name": run_name,
+            "output_root": str(study_dir / "trials"),
+            "ablation": "none",
+        }
+    )
+    values.update(overrides)
+    values["command_override"] = json.dumps(
+        {
+            "study": str(study_dir),
+            "trial": run_name,
+            "configuration": overrides,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return argparse.Namespace(**values)
+
+
+def tune_command(args: argparse.Namespace) -> dict[str, object]:
+    """Run a validation-only hyperparameter study and report the best trial."""
+
+    candidates = hyperparameter_candidates(
+        hidden_values=args.hidden_values,
+        graph_layer_values=args.graph_layer_values,
+        head_values=args.head_values,
+        dropout_values=args.dropout_values,
+        learning_rate_values=args.learning_rate_values,
+        weight_decay_values=args.weight_decay_values,
+        strategy=args.strategy,
+        max_trials=args.max_trials,
+        seed=args.search_seed,
+    )
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    study_name = args.study_name or f"tune_{args.domain}_{stamp}"
+    study_dir = Path(args.output_root) / study_name
+    if study_dir.exists():
+        raise FileExistsError(
+            f"Study directory already exists; choose another --study-name: {study_dir}"
+        )
+    study_dir.mkdir(parents=True)
+    write_json(
+        study_dir / "search_plan.json",
+        {
+            "domain": args.domain,
+            "model": "phymeta_stgt",
+            "selection_metric": "minimum validation sample-level linear NMSE",
+            "test_split_used": False,
+            "strategy": args.strategy,
+            "search_seed": args.search_seed,
+            "training_seed_shared_by_all_trials": args.seed,
+            "candidates": candidates,
+        },
+    )
+    rows: list[dict[str, object]] = []
+    for index, candidate in enumerate(candidates):
+        run_name = f"trial_{index:03d}"
+        seed_everything(args.seed)
+        trial_args = _study_trial_args(
+            args,
+            study_dir,
+            run_name,
+            **candidate,
+        )
+        row: dict[str, object] = {
+            "trial": index,
+            "run_name": run_name,
+            **candidate,
+        }
+        try:
+            outcome = train_command(trial_args)
+            result = outcome["result"]
+            assert isinstance(result, dict)
+            row.update(
+                {
+                    "status": "completed",
+                    "best_validation_nmse_linear": result[
+                        "best_validation_nmse_linear"
+                    ],
+                    "best_validation_nmse_db": result[
+                        "best_validation_nmse_db"
+                    ],
+                    "run_dir": outcome["run_dir"],
+                }
+            )
+        except Exception as exc:
+            row.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        rows.append(row)
+        _write_study_rows(study_dir / "trials.csv", rows)
+        write_json(study_dir / "trials.json", rows)
+    completed = [row for row in rows if row["status"] == "completed"]
+    if not completed:
+        raise RuntimeError(
+            f"All hyperparameter trials failed; inspect {study_dir / 'trials.json'}."
+        )
+    completed.sort(key=lambda row: float(row["best_validation_nmse_linear"]))
+    best = completed[0]
+    summary = {
+        "status": "smoke_search" if args.mode == "smoke" else "validation_search",
+        "study_dir": str(study_dir),
+        "selection_metric": "minimum validation sample-level linear NMSE",
+        "test_split_used": False,
+        "completed_trials": len(completed),
+        "failed_trials": len(rows) - len(completed),
+        "best_trial": best,
+        "best_checkpoint": str(
+            Path(str(best["run_dir"])) / "checkpoints" / "best_checkpoint.pth"
+        ),
+        "ranking": completed,
+    }
+    write_json(study_dir / "best_result.json", summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
+
+
+def ablate_command(args: argparse.Namespace) -> dict[str, object]:
+    """Run controlled one-factor ablations under a shared training protocol."""
+
+    variants = args.variants or ABLATION_VARIANTS
+    if len(set(variants)) != len(variants):
+        raise ValueError("--variants must not contain duplicates.")
+    unknown = sorted(set(variants) - set(ABLATION_VARIANTS))
+    if unknown:
+        raise ValueError(f"Unknown ablation variants: {unknown}.")
+    if "none" not in variants:
+        variants = ("none",) + tuple(variants)
+    if args.domain == "quasi":
+        variants = tuple(
+            variant
+            for variant in variants
+            if variant != "no_temporal_delta_loss"
+        )
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    study_name = args.study_name or f"ablation_{args.domain}_{stamp}"
+    study_dir = Path(args.output_root) / study_name
+    if study_dir.exists():
+        raise FileExistsError(
+            f"Study directory already exists; choose another --study-name: {study_dir}"
+        )
+    study_dir.mkdir(parents=True)
+    rows: list[dict[str, object]] = []
+    for index, variant in enumerate(variants):
+        seed_everything(args.seed)
+        run_name = f"ablation_{index:02d}_{variant}"
+        trial_args = _study_trial_args(
+            args,
+            study_dir,
+            run_name,
+            ablation=variant,
+        )
+        row: dict[str, object] = {
+            "order": index,
+            "variant": variant,
+            "run_name": run_name,
+        }
+        try:
+            outcome = train_command(trial_args)
+            result = outcome["result"]
+            assert isinstance(result, dict)
+            row.update(
+                {
+                    "status": "completed",
+                    "best_validation_nmse_linear": result[
+                        "best_validation_nmse_linear"
+                    ],
+                    "best_validation_nmse_db": result[
+                        "best_validation_nmse_db"
+                    ],
+                    "run_dir": outcome["run_dir"],
+                }
+            )
+        except Exception as exc:
+            row.update(
+                {
+                    "status": "failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
+                }
+            )
+        rows.append(row)
+        _write_study_rows(study_dir / "ablation_results.csv", rows)
+        write_json(study_dir / "ablation_results.json", rows)
+    completed = [row for row in rows if row["status"] == "completed"]
+    reference = next(
+        (row for row in completed if row["variant"] == "none"), None
+    )
+    if reference is None:
+        raise RuntimeError(
+            f"The full-model reference failed; inspect {study_dir / 'ablation_results.json'}."
+        )
+    reference_db = float(reference["best_validation_nmse_db"])
+    for row in completed:
+        row["delta_vs_full_db"] = (
+            float(row["best_validation_nmse_db"]) - reference_db
+        )
+    summary = {
+        "status": "smoke_ablation" if args.mode == "smoke" else "validation_ablation",
+        "study_dir": str(study_dir),
+        "selection_metric": "best validation sample-level linear NMSE per run",
+        "test_split_used": False,
+        "control": {
+            "shared_seed": args.seed,
+            "shared_data_fraction": args.fraction,
+            "shared_epochs": 1 if args.mode == "smoke" else args.epochs,
+            "one_factor_changed_per_variant": True,
+        },
+        "full_model": reference,
+        "results": completed,
+        "failed": [row for row in rows if row["status"] == "failed"],
+    }
+    _write_study_rows(study_dir / "ablation_results.csv", rows)
+    write_json(study_dir / "summary.json", summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
 
 
 def load_checkpoint_model(
@@ -1036,6 +1399,10 @@ def joint_command(args: argparse.Namespace) -> None:
             "history": history,
             "metadata": metadata,
             "parameters": model_parameter_report(model),
+            "complexity": profile_model_complexity(
+                model,
+                canonical_batch("mobility", batch_size=1, device=device),
+            ),
         },
     )
     print(f"Joint run completed: {run_dir}")
@@ -1082,6 +1449,41 @@ def add_model(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dropout", type=float, default=0.0)
 
 
+def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--domain", choices=["quasi", "mobility"], required=True)
+    parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
+    parser.add_argument("--train-path")
+    parser.add_argument("--val-path")
+    parser.add_argument("--obs-times", type=ints, default=(0, 1))
+    parser.add_argument("--fraction", type=float, default=1.0)
+    parser.add_argument("--max-train", type=int)
+    parser.add_argument("--max-val", type=int)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--eval-batch-size", type=int, default=2)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--nmse-weight", type=float, default=1.0)
+    parser.add_argument("--char-weight", type=float, default=0.1)
+    parser.add_argument("--obs-weight", type=float, default=0.1)
+    parser.add_argument("--delta-weight", type=float, default=0.05)
+    parser.add_argument("--study-name")
+    parser.add_argument("--output-root", default="runs")
+    add_data_root(parser)
+    add_data_semantics(parser)
+    add_runtime(parser)
+    add_model(parser)
+    parser.set_defaults(
+        model="phymeta_stgt",
+        adaptation="full",
+        pretrained=None,
+        resume=None,
+        run_name=None,
+        ablation="none",
+    )
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(
         description="LPAN two-dataset channel completion experiments."
@@ -1095,11 +1497,44 @@ def parser() -> argparse.ArgumentParser:
     add_data_semantics(audit)
     audit.set_defaults(func=audit_command)
 
+    profile = commands.add_parser("profile")
+    profile.add_argument("--domain", choices=["quasi", "mobility"], required=True)
+    profile.add_argument(
+        "--models",
+        type=strings,
+        default=(
+            "lpan_l_direct",
+            "edsr_lite",
+            "spatial_gcn",
+            "cnn_gru",
+            "gcn_gru",
+            "phymeta_stgt",
+        ),
+        help="Comma-separated registered model names.",
+    )
+    profile.add_argument("--batch-size", type=int, default=1)
+    profile.add_argument("--device", default="cpu")
+    profile.add_argument("--output", default="runs/complexity_profile.json")
+    profile.add_argument(
+        "--ablation",
+        choices=("none",) + ARCHITECTURE_ABLATIONS,
+        default="none",
+    )
+    add_model(profile)
+    profile.set_defaults(func=profile_command)
+
     train = commands.add_parser("train")
     train.add_argument("--domain", choices=["quasi", "mobility"], required=True)
     train.add_argument(
         "--model",
-        choices=["edsr_lite", "spatial_gcn", "cnn_gru", "gcn_gru", "phymeta_stgt"],
+        choices=[
+            "lpan_l_direct",
+            "edsr_lite",
+            "spatial_gcn",
+            "cnn_gru",
+            "gcn_gru",
+            "phymeta_stgt",
+        ],
         required=True,
     )
     train.add_argument("--mode", choices=["smoke", "full"], default="smoke")
@@ -1126,6 +1561,12 @@ def parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--pretrained")
     train.add_argument("--resume")
+    train.add_argument(
+        "--ablation",
+        choices=ABLATION_VARIANTS,
+        default="none",
+        help="Run one controlled PhyMeta-STGT architecture or loss ablation.",
+    )
     train.add_argument("--run-name")
     train.add_argument("--output-root", default="runs")
     add_data_root(train)
@@ -1217,17 +1658,44 @@ def parser() -> argparse.ArgumentParser:
     add_runtime(joint)
     add_model(joint)
     joint.set_defaults(func=joint_command)
+
+    tune = commands.add_parser("tune")
+    add_study_training_protocol(tune)
+    tune.add_argument("--strategy", choices=["grid", "random"], default="random")
+    tune.add_argument("--max-trials", type=int, default=12)
+    tune.add_argument("--search-seed", type=int, default=2026)
+    tune.add_argument("--hidden-values", type=ints, default=(48, 64, 96))
+    tune.add_argument("--graph-layer-values", type=ints, default=(1, 2, 3))
+    tune.add_argument("--head-values", type=ints, default=(4, 8))
+    tune.add_argument("--dropout-values", type=floats, default=(0.0, 0.1))
+    tune.add_argument(
+        "--learning-rate-values",
+        type=floats,
+        default=(1e-4, 2e-4, 5e-4),
+    )
+    tune.add_argument(
+        "--weight-decay-values", type=floats, default=(0.0, 1e-5)
+    )
+    tune.set_defaults(func=tune_command)
+
+    ablate = commands.add_parser("ablate")
+    add_study_training_protocol(ablate)
+    ablate.add_argument(
+        "--variants",
+        type=strings,
+        help=(
+            "Comma-separated variants. The full model is always included. "
+            f"Available: {','.join(ABLATION_VARIANTS)}"
+        ),
+    )
+    ablate.set_defaults(func=ablate_command)
     return root
 
 
 def main() -> None:
     args = parser().parse_args()
     seed = getattr(args, "seed", 123)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_everything(seed)
     args.func(args)
 
 
