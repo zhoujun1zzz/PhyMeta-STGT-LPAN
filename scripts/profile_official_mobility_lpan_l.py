@@ -71,6 +71,7 @@ def main() -> None:
     batch = canonical_batch("mobility", batch_size=1, device=device)
     result = {
         "model": "official_progressive_mobility_lpan_l",
+        "display_name": "Official progressive Mobility LPAN-L",
         "source_root": str(Path(args.source_root).resolve()),
         **profile_model_complexity(model, batch),
     }

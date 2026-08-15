@@ -42,36 +42,121 @@ def linear_query_weights(
     return restored
 
 
+def grid_aware_spatial_interpolation_weights(
+    obs_index: torch.Tensor,
+    nodes: int = 256,
+    nearest: bool = False,
+    grid_width: int = 16,
+) -> torch.Tensor:
+    """Build row-wise interpolation weights on the physical RIS grid.
+
+    A query node may use observations from its own row only. Linear mode uses
+    piecewise interpolation between observed columns and constant nearest-value
+    extension outside their range. Nearest mode also stays within the row.
+    """
+
+    if nodes <= 0 or grid_width <= 0 or nodes % grid_width:
+        raise ValueError("nodes must be positive and divisible by grid_width.")
+    index = obs_index.to(dtype=torch.long)
+    if index.ndim != 1 or index.numel() == 0:
+        raise ValueError("obs_index must be a non-empty one-dimensional tensor.")
+    if int(index.min()) < 0 or int(index.max()) >= nodes:
+        raise ValueError(f"Observed RIS indices must be in [0, {nodes - 1}].")
+    if torch.unique(index).numel() != index.numel():
+        raise ValueError("Observed RIS indices must be unique.")
+    weights = torch.zeros(
+        nodes, index.numel(), device=index.device, dtype=torch.float32
+    )
+    observed_rows = torch.div(index, grid_width, rounding_mode="floor")
+    observed_cols = index % grid_width
+    for row in range(nodes // grid_width):
+        row_positions = torch.where(observed_rows == row)[0]
+        if row_positions.numel() == 0:
+            raise ValueError(
+                f"Grid-aware interpolation requires at least one observation "
+                f"in RIS row {row}."
+            )
+        order = torch.argsort(observed_cols[row_positions])
+        positions = row_positions[order]
+        columns = observed_cols[positions].to(torch.float32)
+        for column in range(grid_width):
+            node = row * grid_width + column
+            value = torch.tensor(float(column), device=index.device)
+            distances = torch.abs(columns - value)
+            if nearest or positions.numel() == 1:
+                weights[node, positions[torch.argmin(distances)]] = 1
+            elif value <= columns[0]:
+                weights[node, positions[0]] = 1
+            elif value >= columns[-1]:
+                weights[node, positions[-1]] = 1
+            else:
+                right = int(torch.searchsorted(columns, value).item())
+                if columns[right] == value:
+                    weights[node, positions[right]] = 1
+                else:
+                    left = right - 1
+                    alpha = (value - columns[left]) / (
+                        columns[right] - columns[left]
+                    )
+                    weights[node, positions[left]] = 1 - alpha
+                    weights[node, positions[right]] = alpha
+    return weights
+
+
 def spatial_interpolation_weights(
     obs_index: torch.Tensor, nodes: int = 256, nearest: bool = False
 ) -> torch.Tensor:
-    index = obs_index.to(dtype=torch.float32)
-    query = torch.arange(nodes, device=index.device, dtype=torch.float32)
-    weights = torch.zeros(nodes, index.numel(), device=index.device)
-    for ni, value in enumerate(query):
-        distances = torch.abs(index - value)
-        if nearest or value <= index.min() or value >= index.max():
-            weights[ni, torch.argmin(distances)] = 1
-            continue
-        right = int(torch.searchsorted(index, value).item())
-        if index[right] == value:
-            weights[ni, right] = 1
-        else:
-            left = right - 1
-            alpha = (value - index[left]) / (index[right] - index[left])
-            weights[ni, left] = 1 - alpha
-            weights[ni, right] = alpha
-    return weights
+    """Compatibility name for the grid-aware interpolation implementation."""
+
+    return grid_aware_spatial_interpolation_weights(
+        obs_index, nodes=nodes, nearest=nearest
+    )
 
 
 def expand_observations_to_grid(
     batch: Mapping[str, torch.Tensor],
+    *,
+    nearest: bool = False,
 ) -> torch.Tensor:
-    """Place sparse RIS observations on their physical 256-node coordinate grid."""
+    """Expand sparse observations using row-wise physical-grid interpolation."""
+
     obs = batch["obs_h"]
     obs_index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
-    weights = spatial_interpolation_weights(obs_index).to(obs.dtype)
-    return torch.einsum("np,btpmc->btnmc", weights, obs)
+    weights = grid_aware_spatial_interpolation_weights(
+        obs_index, nearest=nearest
+    ).to(obs.dtype)
+    raw_mask = batch.get("observation_mask")
+    if raw_mask is None:
+        return torch.einsum("np,btpmc->btnmc", weights, obs)
+    mask = raw_mask.to(device=obs.device, dtype=torch.bool)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if tuple(mask.shape) != tuple(obs.shape[:3]):
+        raise ValueError(
+            "observation_mask must match [batch, observed_time, observed_RIS]."
+        )
+    batches: list[torch.Tensor] = []
+    for batch_index in range(obs.shape[0]):
+        times: list[torch.Tensor] = []
+        for time_index in range(obs.shape[1]):
+            valid_positions = torch.where(mask[batch_index, time_index])[0]
+            if valid_positions.numel() == 0:
+                raise ValueError(
+                    "Every (sample, observed_time) must contain at least one "
+                    "valid observation."
+                )
+            valid_indices = obs_index.index_select(0, valid_positions)
+            local_weights = grid_aware_spatial_interpolation_weights(
+                valid_indices, nearest=nearest
+            ).to(obs.dtype)
+            valid_observations = obs[batch_index, time_index].index_select(
+                0, valid_positions
+            )
+            times.append(
+                torch.einsum("np,pmc->nmc", local_weights, valid_observations)
+            )
+        batches.append(torch.stack(times, dim=0))
+    return torch.stack(batches, dim=0)
 
 
 @torch.no_grad()
@@ -82,14 +167,12 @@ def interpolation_baseline(
     temporal: str = "linear",
 ) -> torch.Tensor:
     obs = batch["obs_h"]
-    obs_index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
     obs_time = _shared_vector(batch["obs_time_index"]).to(obs.device)
     query_time = _shared_vector(batch["query_time"]).to(obs.device)
     if spatial == "linear":
         spatial_full = expand_observations_to_grid(batch)
     else:
-        sw = spatial_interpolation_weights(obs_index, nearest=True).to(obs.dtype)
-        spatial_full = torch.einsum("np,btpmc->btnmc", sw, obs)
+        spatial_full = expand_observations_to_grid(batch, nearest=True)
     if temporal == "nearest":
         distances = torch.abs(
             query_time[:, None].float() - obs_time[None, :].float()
@@ -204,6 +287,20 @@ class LPANLDirect(nn.Module):
         b, t, p, m, _ = obs.shape
         if p != 32:
             raise ValueError(f"LPANLDirect expects 32 observed RIS columns, got {p}.")
+        index = batch["obs_ris_index"].to(obs.device)
+        expected = torch.arange(0, 256, 8, device=obs.device)
+        if index.ndim == 1:
+            compatible = index.shape == expected.shape and torch.equal(index, expected)
+        else:
+            compatible = (
+                index.shape[-1] == expected.numel()
+                and bool((index == expected.view(1, -1)).all())
+            )
+        if not compatible:
+            raise ValueError(
+                "LPAN-L-Direct supports only the verified official LPAN "
+                "ordering obs_ris_index=(0,8,...,248)."
+            )
         x = obs.permute(0, 4, 1, 3, 2).reshape(b, 2 * t, m, p)
         features = self.body(self.head(x))
         features = F.interpolate(
@@ -530,6 +627,11 @@ class PhyMetaSTGT(nn.Module):
         if self.coord_encoder is not None:
             observed = observed + self.coord_encoder(xy[index]).unsqueeze(0)
         observation_mask = batch["observation_mask"].reshape(b * t, p).bool()
+        if not bool(observation_mask.any(dim=1).all()):
+            raise ValueError(
+                "Every (sample, observed_time) must contain at least one "
+                "valid observation token."
+            )
         observed = observed * observation_mask.unsqueeze(-1)
         if self.spatial_cross_attention is None:
             dense = expand_observations_to_grid(batch).reshape(b * t, 256, 128)
@@ -599,7 +701,7 @@ def build_model(
     blocks = (1, 1) if domain == "quasi" else (2, 6)
     if name in {"edsr", "edsr_lite"}:
         return EDSRLite(*blocks, hidden=max(32, hidden), layers=graph_layers + 2)
-    if name in {"lpan_l_direct", "lpanl_direct", "lpan_l"}:
+    if name in {"lpan_l_direct", "lpanl_direct"}:
         return LPANLDirect(*blocks)
     if name in {"spatial_gcn", "gcn"}:
         return SpatialGCN(hidden, graph_layers)

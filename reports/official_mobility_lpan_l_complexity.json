@@ -1,5 +1,6 @@
 {
   "model": "official_progressive_mobility_lpan_l",
+  "display_name": "Official progressive Mobility LPAN-L",
   "source_root": "D:\\数据1\\LPAN_mobility_baseline",
   "total_parameters": 1112904,
   "trainable_parameters": 1112904,
@@ -25,12 +26,13 @@
   "dtype": "float32",
   "scope": "single forward pass; model operations only; no backward",
   "convention": "1 MAC = 2 FLOPs",
+  "interpolation_policy": "excluded in full: spatial/temporal interpolation, sparse-to-dense expansion einsums, and framework interpolation kernels are not counted",
   "excluded_operations": [
     "bias",
     "normalization",
     "activation",
     "softmax",
     "indexing",
-    "interpolation"
+    "interpolation (all spatial and temporal paths)"
   ]
 }

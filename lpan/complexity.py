@@ -7,11 +7,14 @@ import torch
 from torch import nn
 
 from .models import (
-    CNNGRU,
-    EDSRLite,
     GridGraphConv,
-    PhyMetaSTGT,
     SparseGraphAttention,
+)
+
+
+INTERPOLATION_POLICY = (
+    "excluded in full: spatial/temporal interpolation, sparse-to-dense "
+    "expansion einsums, and framework interpolation kernels are not counted"
 )
 
 
@@ -240,8 +243,8 @@ def profile_model_complexity(
 
     Multiply-accumulate operations from convolutions, linear projections,
     recurrent cells, attention products and graph aggregation are counted.
-    Bias, normalization, activation, softmax, indexing and interpolation costs
-    are excluded.  FLOPs use the transparent conversion 1 MAC = 2 FLOPs.
+    Bias, normalization, activation, softmax, indexing and every interpolation
+    path are excluded. FLOPs use the transparent conversion 1 MAC = 2 FLOPs.
     """
 
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -258,35 +261,7 @@ def profile_model_complexity(
     if was_training:
         model.train()
     obs = batch["obs_h"]
-    batch_size, observed_blocks, observed_nodes, antennas, complex_parts = obs.shape
-    if isinstance(model, (EDSRLite, CNNGRU)):
-        counter.macs += int(
-            batch_size
-            * observed_blocks
-            * 256
-            * observed_nodes
-            * antennas
-            * complex_parts
-        )
-    if isinstance(model, PhyMetaSTGT):
-        if model.spatial_cross_attention is None:
-            counter.macs += int(
-                batch_size
-                * observed_blocks
-                * 256
-                * observed_nodes
-                * antennas
-                * complex_parts
-            )
-        if model.temporal_attention is None:
-            query_blocks = output.shape[1]
-            counter.macs += int(
-                batch_size
-                * 256
-                * query_blocks
-                * observed_blocks
-                * model.hidden
-            )
+    batch_size = obs.shape[0]
     macs = int(counter.macs)
     flops = 2 * macs
     return {
@@ -302,12 +277,13 @@ def profile_model_complexity(
         "dtype": str(obs.dtype).replace("torch.", ""),
         "scope": "single forward pass; model operations only; no backward",
         "convention": "1 MAC = 2 FLOPs",
+        "interpolation_policy": INTERPOLATION_POLICY,
         "excluded_operations": [
             "bias",
             "normalization",
             "activation",
             "softmax",
             "indexing",
-            "interpolation",
+            "interpolation (all spatial and temporal paths)",
         ],
     }

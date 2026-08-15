@@ -39,10 +39,10 @@ claimed until a frozen-checkpoint evaluation artifact is located or generated.
 - Test artifact:
   `D:\数据1\LPAN_mobility_baseline\runs\mobility_lpan_l\independent_test\independent_test_result.json`
 
-The official progressive model and this repository's `lpan_l_direct` model are
-different architectures. Their parameter counts, operation counts and results
-must occupy separately labeled rows. The direct model must not inherit the
-official model's `-19.7268 dB` test result.
+The official progressive model and this repository's LPAN-L-Direct model (CLI
+key: `lpan_l_direct`) are different architectures. Their parameter counts,
+operation counts and results must occupy separately labeled rows. LPAN-L-Direct
+must not inherit the official model's `-19.7268 dB` test result.
 
 ## Mobility data contract
 
@@ -57,6 +57,10 @@ official model's `-19.7268 dB` test result.
   blocks
 - Frame semantics: two pilot blocks reconstruct six target blocks inside one
   sample
+
+These labels belong to the `official_lpan` semantic profile. The loader rejects
+different pilot times, RIS indices, or complex layouts under that profile;
+`custom` is reserved for independently rearranged or regenerated files.
 
 No public `user_id`, `trajectory_id`, `sequence_id`, `timestamp`, position or
 velocity metadata has been found. Consecutive MAT samples must not be described
@@ -85,10 +89,11 @@ Report both GMACs and GFLOPs under these shared conditions:
 - `1 MAC = 2 FLOPs`.
 
 The profiler counts convolution, linear, recurrent, attention-product and graph
-aggregation MACs. Bias, normalization, activation, softmax, indexing and
-interpolation are disclosed as excluded. Numbers produced by THOP, fvcore,
-ptflops or a paper cannot be mixed into the same column unless their counting
-scope and MAC/FLOP conversion have been reconciled.
+aggregation MACs. Bias, normalization, activation, softmax, indexing and every
+spatial/temporal interpolation path are excluded for all models, including
+sparse-to-dense expansion einsums and framework interpolation kernels. Numbers
+produced by THOP, fvcore, ptflops or a paper cannot be mixed into the same
+column unless their counting scope and MAC/FLOP conversion have been reconciled.
 
 The generated same-condition results are summarized in
 `reports/complexity_summary.md`. In particular, the official progressive
