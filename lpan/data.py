@@ -94,6 +94,11 @@ class LPANH5Dataset(Dataset):
         fraction: float = 1.0,
         subset_seed: int = 123,
     ) -> None:
+        # Initialize lazy handles before any validation that may raise. This
+        # keeps __del__/close safe for partially constructed dataset objects.
+        self._file: h5py.File | None = None
+        self._input: h5py.Dataset | None = None
+        self._target: h5py.Dataset | None = None
         if domain not in SPECS:
             raise ValueError(f"domain must be one of {sorted(SPECS)}, got {domain!r}")
         if not 0 < fraction <= 1:
@@ -164,9 +169,6 @@ class LPANH5Dataset(Dataset):
             self.indices = np.arange(count, dtype=np.int64)
 
         self.total_samples_in_file = total
-        self._file: h5py.File | None = None
-        self._input: h5py.Dataset | None = None
-        self._target: h5py.Dataset | None = None
 
     def _resolve_keys(self, handle: h5py.File) -> tuple[str, str]:
         keys = set(handle.keys())

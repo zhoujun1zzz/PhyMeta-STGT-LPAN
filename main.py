@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import random
 import shlex
@@ -37,7 +38,7 @@ from lpan.engine import (
 )
 from lpan.metrics import MetricAccumulator
 from lpan.models import build_model, interpolation_baseline
-from lpan.objectives import LossWeights
+from lpan.objectives import LossWeights, combined_loss
 from lpan.paths import (
     dataset_candidates,
     default_data_root,
@@ -377,6 +378,136 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
     return report
 
 
+def select_fastest_batch(rows: list[dict[str, object]]) -> dict[str, object]:
+    completed = [row for row in rows if row.get("status") == "completed"]
+    if not completed:
+        raise RuntimeError("No batch-size candidate completed successfully.")
+    return max(completed, key=lambda row: float(row["samples_per_second"]))
+
+
+def benchmark_batch_command(args: argparse.Namespace) -> dict[str, object]:
+    """Benchmark training throughput without producing reportable results."""
+
+    if args.max_samples <= 0:
+        raise ValueError("--max-samples must be positive.")
+    if not args.candidates or any(value <= 0 for value in args.candidates):
+        raise ValueError("--candidates must contain positive batch sizes.")
+    if len(set(args.candidates)) != len(args.candidates):
+        raise ValueError("--candidates must not contain duplicates.")
+    device = device_from(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA benchmark requested but CUDA is unavailable.")
+    obs_times = args.obs_times if args.domain == "mobility" else (0,)
+    rows: list[dict[str, object]] = []
+    for batch_size in args.candidates:
+        seed_everything(args.seed)
+        row: dict[str, object] = {"batch_size": batch_size}
+        model = optimizer = loader = None
+        warmup = warmup_prediction = warmup_loss = None
+        try:
+            model = build_model(
+                "phymeta_stgt",
+                domain=args.domain,
+                hidden=args.hidden,
+                graph_layers=args.graph_layers,
+                heads=args.heads,
+                dropout=args.dropout,
+            ).to(device)
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
+            loader = make_loader(
+                args.domain,
+                "train",
+                path=args.train_path,
+                data_root=args.data_root,
+                batch_size=batch_size,
+                workers=args.workers,
+                max_samples=args.max_samples,
+                seed=args.seed,
+                obs_times=obs_times,
+                obs_ris_indices=args.obs_ris_indices,
+                complex_layout=args.complex_layout,
+                semantic_profile=args.semantic_profile,
+                shuffle=True,
+            )
+            # One untimed step initializes CUDA kernels and worker queues.
+            warmup = move_batch(next(iter(loader)), device)
+            optimizer.zero_grad(set_to_none=True)
+            warmup_prediction = model(warmup)
+            warmup_loss, _ = combined_loss(
+                warmup_prediction, warmup, LossWeights()
+            )
+            warmup_loss.backward()
+            optimizer.step()
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+            started = time.perf_counter()
+            train_epoch(
+                model,
+                loader,
+                optimizer,
+                device,
+                LossWeights(),
+                grad_clip=args.grad_clip,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+            row.update(
+                {
+                    "status": "completed",
+                    "samples": len(loader.dataset),
+                    "elapsed_seconds": elapsed,
+                    "samples_per_second": len(loader.dataset) / elapsed,
+                    "peak_memory_bytes": (
+                        int(torch.cuda.max_memory_allocated(device))
+                        if device.type == "cuda"
+                        else None
+                    ),
+                }
+            )
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            row.update(
+                {
+                    "status": "oom",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        finally:
+            if loader is not None and hasattr(loader.dataset, "close"):
+                loader.dataset.close()
+            del warmup, warmup_prediction, warmup_loss
+            del loader, optimizer, model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        rows.append(row)
+        write_json(Path(args.output), {"results": rows})
+    best = select_fastest_batch(rows)
+    report = {
+        "status": "non_reportable_throughput_benchmark",
+        "domain": args.domain,
+        "device": str(device),
+        "model": "phymeta_stgt",
+        "max_samples": args.max_samples,
+        "workers": args.workers,
+        "test_split_used": False,
+        "candidates": list(args.candidates),
+        "results": rows,
+        "selected_batch_size": int(best["batch_size"]),
+        "selection_metric": "maximum training samples per second without OOM",
+    }
+    write_json(Path(args.output), report)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return report
+
+
 def validate_training_request(
     model_name: str,
     adaptation: str,
@@ -472,6 +603,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     max_train = args.max_train or (64 if smoke else None)
     max_val = args.max_val or (16 if smoke else None)
     epochs = 1 if smoke else args.epochs
+    stopping = early_stopping_config(args, smoke=smoke)
     train_loader = make_loader(
         domain,
         "train",
@@ -579,6 +711,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "grad_clip": args.grad_clip,
+        "early_stopping": stopping,
         "loss_weights": {
             "nmse": weights.nmse,
             "charbonnier": weights.charbonnier,
@@ -587,6 +720,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         },
     }
     start_epoch, best_nmse = 1, float("inf")
+    stale_epochs = 0
     history: list[dict[str, object]] = []
     if args.resume:
         state = torch.load(args.resume, map_location=device, weights_only=False)
@@ -673,6 +807,10 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
                 saved_metadata.get("grad_clip"),
                 metadata["grad_clip"],
             ),
+            "early_stopping": (
+                saved_metadata.get("early_stopping"),
+                metadata["early_stopping"],
+            ),
             "loss_weights": (
                 saved_metadata.get("loss_weights"),
                 metadata["loss_weights"],
@@ -732,6 +870,15 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
                     f"{original_last_epoch} to checkpoint epoch "
                     f"{checkpoint_epoch}\n"
                 )
+        history_best_nmse, stale_epochs = early_stopping_progress(
+            history,
+            min_epochs=int(stopping["min_epochs"]),
+        )
+        if not np.isclose(history_best_nmse, best_nmse, rtol=1e-9, atol=1e-12):
+            raise ValueError(
+                "Checkpoint best_nmse does not match training_history.csv: "
+                f"checkpoint={best_nmse}, history={history_best_nmse}."
+            )
         restore_rng_state(
             state["rng_state"],
             {
@@ -745,6 +892,8 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         ) as handle:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {command}\n")
 
+    stopped_early = False
+    stop_reason = None
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
         train_result = train_epoch(
@@ -757,12 +906,23 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         )
         val_result = evaluate_model(model, val_loader, device)
         val_nmse = float(val_result["nmse_linear"]["overall"])
+        best_nmse, stale_epochs, improved, should_stop = early_stopping_step(
+            best_nmse=best_nmse,
+            stale_epochs=stale_epochs,
+            validation_nmse=val_nmse,
+            epoch=epoch,
+            enabled=bool(stopping["enabled"]),
+            min_epochs=int(stopping["min_epochs"]),
+            patience=int(stopping["patience"]),
+        )
         row = {
             "epoch": epoch,
             "train_total": train_result["total"],
             "train_nmse": train_result["nmse"],
             "validation_nmse_linear": val_nmse,
             "validation_nmse_db": nmse_db_from_result(val_result),
+            "improved": improved,
+            "early_stopping_stale_epochs": stale_epochs,
             "epoch_seconds": time.perf_counter() - started,
         }
         history.append(row)
@@ -778,14 +938,13 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             model,
             optimizer,
             epoch=epoch,
-            best_nmse=min(best_nmse, val_nmse),
+            best_nmse=best_nmse,
             model_name=args.model,
             model_config=config,
             metadata=metadata,
             rng_state=rng_state,
         )
-        if val_nmse < best_nmse:
-            best_nmse = val_nmse
+        if improved:
             save_checkpoint(
                 checkpoints / "best_checkpoint.pth",
                 model,
@@ -801,6 +960,14 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             f"epoch={epoch} train={train_result['total']:.6g} "
             f"val={row['validation_nmse_db']:.4f} dB"
         )
+        if should_stop:
+            stopped_early = True
+            stop_reason = (
+                f"validation NMSE did not improve for {stale_epochs} epochs "
+                f"after min_epochs={stopping['min_epochs']}"
+            )
+            print(f"Early stopping at epoch {epoch}: {stop_reason}")
+            break
     complexity = profile_model_complexity(
         model, canonical_batch(domain, batch_size=1, device=device)
     )
@@ -808,6 +975,10 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "status": "smoke_test" if smoke else "validation",
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * torch.log10(torch.tensor(best_nmse)).item(),
+        "epochs_completed": int(history[-1]["epoch"]) if history else 0,
+        "max_epochs": epochs,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
         "history": history,
         "metadata": metadata,
         "parameters": model_parameter_report(model),
@@ -856,12 +1027,13 @@ def _study_trial_args(
         },
         ensure_ascii=False,
         sort_keys=True,
+        default=str,
     )
     return argparse.Namespace(**values)
 
 
 def tune_command(args: argparse.Namespace) -> dict[str, object]:
-    """Run a validation-only hyperparameter study and report the best trial."""
+    """Run validation-only successive-halving style hyperparameter search."""
 
     candidates = hyperparameter_candidates(
         hidden_values=args.hidden_values,
@@ -874,6 +1046,21 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
         max_trials=args.max_trials,
         seed=args.search_seed,
     )
+    smoke = args.mode == "smoke"
+    round1_epochs = 1 if smoke else int(args.round1_epochs)
+    final_epochs = 1 if smoke else int(args.epochs)
+    promote_top_k = 0 if smoke else int(args.promote_top_k)
+    if not smoke:
+        if round1_epochs <= 0 or round1_epochs >= final_epochs:
+            raise ValueError(
+                "Full multi-fidelity search requires 0 < --round1-epochs "
+                "< --epochs."
+            )
+        if promote_top_k <= 0 or promote_top_k > len(candidates):
+            raise ValueError(
+                "--promote-top-k must be positive and no larger than the "
+                "number of candidates."
+            )
     stamp = time.strftime("%Y%m%d_%H%M%S")
     study_name = args.study_name or f"tune_{args.domain}_{stamp}"
     study_dir = Path(args.output_root) / study_name
@@ -892,6 +1079,19 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
             "strategy": args.strategy,
             "search_seed": args.search_seed,
             "training_seed_shared_by_all_trials": args.seed,
+            "protocol": {
+                "name": "two_round_validation_promotion",
+                "round1_epochs": round1_epochs,
+                "promote_top_k": promote_top_k,
+                "final_max_epochs": final_epochs,
+                "promotion_checkpoint": "epoch round1 last_checkpoint.pth",
+                "resume_preserves_rng": True,
+                "early_stopping": {
+                    "enabled": bool(args.early_stopping and not smoke),
+                    "min_epochs": args.min_epochs,
+                    "patience": args.patience,
+                },
+            },
             "candidates": candidates,
         },
     )
@@ -903,6 +1103,7 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
             args,
             study_dir,
             run_name,
+            epochs=round1_epochs,
             **candidate,
         )
         row: dict[str, object] = {
@@ -916,20 +1117,22 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
             assert isinstance(result, dict)
             row.update(
                 {
-                    "status": "completed",
-                    "best_validation_nmse_linear": result[
+                    "status": "round1_completed",
+                    "round1_epochs_completed": result["epochs_completed"],
+                    "round1_best_validation_nmse_linear": result[
                         "best_validation_nmse_linear"
                     ],
-                    "best_validation_nmse_db": result[
+                    "round1_best_validation_nmse_db": result[
                         "best_validation_nmse_db"
                     ],
                     "run_dir": outcome["run_dir"],
+                    "promoted": False,
                 }
             )
         except Exception as exc:
             row.update(
                 {
-                    "status": "failed",
+                    "status": "round1_failed",
                     "error": f"{type(exc).__name__}: {exc}",
                     "traceback": traceback.format_exc(),
                 }
@@ -937,21 +1140,117 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
         rows.append(row)
         _write_study_rows(study_dir / "trials.csv", rows)
         write_json(study_dir / "trials.json", rows)
-    completed = [row for row in rows if row["status"] == "completed"]
-    if not completed:
+        if row["status"] == "round1_failed" and not smoke:
+            raise RuntimeError(
+                f"Round-1 trial {index} failed; inspect "
+                f"{study_dir / 'trials.json'}."
+            )
+    round1_completed = [
+        row for row in rows if row["status"] == "round1_completed"
+    ]
+    if not round1_completed:
         raise RuntimeError(
             f"All hyperparameter trials failed; inspect {study_dir / 'trials.json'}."
         )
-    completed.sort(key=lambda row: float(row["best_validation_nmse_linear"]))
-    best = completed[0]
+    round1_ranking = sorted(
+        round1_completed,
+        key=lambda row: float(row["round1_best_validation_nmse_linear"]),
+    )
+
+    if smoke:
+        final_ranking = round1_ranking
+        for row in final_ranking:
+            row["best_validation_nmse_linear"] = row[
+                "round1_best_validation_nmse_linear"
+            ]
+            row["best_validation_nmse_db"] = row[
+                "round1_best_validation_nmse_db"
+            ]
+    else:
+        promoted = round1_ranking[:promote_top_k]
+        for promotion_rank, row in enumerate(promoted, start=1):
+            row["promoted"] = True
+            row["promotion_rank"] = promotion_rank
+            run_dir = Path(str(row["run_dir"]))
+            resume_path = run_dir / "checkpoints" / "last_checkpoint.pth"
+            if not resume_path.is_file():
+                raise FileNotFoundError(
+                    f"Promotion checkpoint is missing: {resume_path}"
+                )
+            candidate = {
+                key: row[key]
+                for key in (
+                    "hidden",
+                    "graph_layers",
+                    "heads",
+                    "dropout",
+                    "learning_rate",
+                    "weight_decay",
+                )
+            }
+            seed_everything(args.seed)
+            promoted_args = _study_trial_args(
+                args,
+                study_dir,
+                str(row["run_name"]),
+                epochs=final_epochs,
+                resume=str(resume_path),
+                **candidate,
+            )
+            try:
+                outcome = train_command(promoted_args)
+                result = outcome["result"]
+                assert isinstance(result, dict)
+                row.update(
+                    {
+                        "status": "promoted_completed",
+                        "final_epochs_completed": result["epochs_completed"],
+                        "stopped_early": result["stopped_early"],
+                        "best_validation_nmse_linear": result[
+                            "best_validation_nmse_linear"
+                        ],
+                        "best_validation_nmse_db": result[
+                            "best_validation_nmse_db"
+                        ],
+                    }
+                )
+            except Exception as exc:
+                row.update(
+                    {
+                        "status": "promotion_failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+            _write_study_rows(study_dir / "trials.csv", rows)
+            write_json(study_dir / "trials.json", rows)
+            if row["status"] == "promotion_failed":
+                raise RuntimeError(
+                    f"Promotion for trial {row['trial']} failed; inspect "
+                    f"{study_dir / 'trials.json'}."
+                )
+        final_ranking = sorted(
+            (row for row in promoted if row["status"] == "promoted_completed"),
+            key=lambda row: float(row["best_validation_nmse_linear"]),
+        )
+    best = final_ranking[0]
     summary = {
         "status": "smoke_search" if args.mode == "smoke" else "validation_search",
         "domain": args.domain,
         "study_dir": str(study_dir),
         "selection_metric": "minimum validation sample-level linear NMSE",
         "test_split_used": False,
-        "completed_trials": len(completed),
-        "failed_trials": len(rows) - len(completed),
+        "protocol": "round1_all_candidates_then_top_k_resume",
+        "round1_epochs": round1_epochs,
+        "final_max_epochs": final_epochs,
+        "promote_top_k": promote_top_k,
+        "round1_completed_trials": len(round1_completed),
+        "promoted_completed_trials": (
+            0 if smoke else len(final_ranking)
+        ),
+        "failed_trials": len(
+            [row for row in rows if str(row["status"]).endswith("failed")]
+        ),
         "best_trial": best,
         "best_hyperparameters": {
             key: best[key]
@@ -967,7 +1266,8 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
         "best_checkpoint": str(
             Path(str(best["run_dir"])) / "checkpoints" / "best_checkpoint.pth"
         ),
-        "ranking": completed,
+        "round1_ranking": [int(row["trial"]) for row in round1_ranking],
+        "ranking": final_ranking,
     }
     write_json(study_dir / "best_result.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -1040,6 +1340,73 @@ def _load_best_hyperparameters(
     if float(config["weight_decay"]) < 0.0:
         raise ValueError("Best-result weight_decay must be non-negative.")
     return config
+
+
+def early_stopping_progress(
+    history: list[dict[str, object]],
+    *,
+    min_epochs: int,
+) -> tuple[float, int]:
+    """Reconstruct best NMSE and post-warmup stale epochs from history."""
+
+    best_nmse = float("inf")
+    stale_epochs = 0
+    for row in history:
+        epoch = int(row["epoch"])
+        value = float(row["validation_nmse_linear"])
+        if value < best_nmse:
+            best_nmse = value
+            stale_epochs = 0
+        elif epoch > min_epochs:
+            stale_epochs += 1
+        else:
+            # Patience starts only after the required minimum training budget.
+            stale_epochs = 0
+    return best_nmse, stale_epochs
+
+
+def early_stopping_step(
+    *,
+    best_nmse: float,
+    stale_epochs: int,
+    validation_nmse: float,
+    epoch: int,
+    enabled: bool,
+    min_epochs: int,
+    patience: int,
+) -> tuple[float, int, bool, bool]:
+    improved = validation_nmse < best_nmse
+    if improved:
+        best_nmse = validation_nmse
+        stale_epochs = 0
+    elif epoch > min_epochs:
+        stale_epochs += 1
+    else:
+        stale_epochs = 0
+    should_stop = (
+        enabled and epoch > min_epochs and stale_epochs >= patience
+    )
+    return best_nmse, stale_epochs, improved, should_stop
+
+
+def early_stopping_config(
+    args: argparse.Namespace,
+    *,
+    smoke: bool,
+) -> dict[str, object]:
+    min_epochs = int(args.min_epochs)
+    patience = int(args.patience)
+    if min_epochs < 0:
+        raise ValueError("--min-epochs must be non-negative.")
+    if patience <= 0:
+        raise ValueError("--patience must be positive.")
+    return {
+        "enabled": bool(args.early_stopping and not smoke),
+        "min_epochs": min_epochs,
+        "patience": patience,
+        "selection_metric": "validation sample-level linear NMSE",
+        "test_split_used": False,
+    }
 
 
 def ablate_command(args: argparse.Namespace) -> dict[str, object]:
@@ -1649,10 +2016,29 @@ def joint_command(args: argparse.Namespace) -> None:
     print(f"Joint run completed: {run_dir}")
 
 
-def add_runtime(parser: argparse.ArgumentParser) -> None:
+def add_runtime(
+    parser: argparse.ArgumentParser,
+    *,
+    batch_size: int = 32,
+    workers: int = 8,
+) -> None:
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=workers)
+    parser.add_argument("--batch-size", type=int, default=batch_size)
+
+
+def add_early_stopping(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--early-stopping",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use validation-NMSE early stopping in full mode. Smoke mode "
+            "always runs its single epoch."
+        ),
+    )
+    parser.add_argument("--min-epochs", type=int, default=40)
+    parser.add_argument("--patience", type=int, default=15)
 
 
 def add_data_root(parser: argparse.ArgumentParser) -> None:
@@ -1709,7 +2095,7 @@ def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-train", type=int)
     parser.add_argument("--max-val", type=int)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--eval-batch-size", type=int, default=2)
+    parser.add_argument("--eval-batch-size", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -1724,6 +2110,7 @@ def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
     add_data_semantics(parser)
     add_runtime(parser)
     add_model(parser)
+    add_early_stopping(parser)
     parser.set_defaults(
         model="phymeta_stgt",
         adaptation="full",
@@ -1773,6 +2160,30 @@ def parser() -> argparse.ArgumentParser:
     add_model(profile)
     profile.set_defaults(func=profile_command)
 
+    benchmark = commands.add_parser("benchmark-batch")
+    benchmark.add_argument(
+        "--domain", choices=["quasi", "mobility"], required=True
+    )
+    benchmark.add_argument("--train-path")
+    benchmark.add_argument("--obs-times", type=ints, default=(0, 1))
+    benchmark.add_argument(
+        "--candidates", type=ints, default=(16, 32, 64, 128)
+    )
+    benchmark.add_argument("--max-samples", type=int, default=1024)
+    benchmark.add_argument("--workers", type=int, default=8)
+    benchmark.add_argument("--device", default="cuda")
+    benchmark.add_argument("--seed", type=int, default=123)
+    benchmark.add_argument("--learning-rate", type=float, default=2e-4)
+    benchmark.add_argument("--weight-decay", type=float, default=1e-5)
+    benchmark.add_argument("--grad-clip", type=float, default=1.0)
+    benchmark.add_argument(
+        "--output", default="runs/batch_benchmark.json"
+    )
+    add_data_root(benchmark)
+    add_data_semantics(benchmark)
+    add_model(benchmark)
+    benchmark.set_defaults(func=benchmark_batch_command)
+
     train = commands.add_parser("train")
     train.add_argument("--domain", choices=["quasi", "mobility"], required=True)
     train.add_argument(
@@ -1795,7 +2206,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--max-train", type=int)
     train.add_argument("--max-val", type=int)
     train.add_argument("--epochs", type=int, default=100)
-    train.add_argument("--eval-batch-size", type=int, default=2)
+    train.add_argument("--eval-batch-size", type=int, default=64)
     train.add_argument("--learning-rate", type=float, default=2e-4)
     train.add_argument("--weight-decay", type=float, default=1e-5)
     train.add_argument("--grad-clip", type=float, default=1.0)
@@ -1823,6 +2234,7 @@ def parser() -> argparse.ArgumentParser:
     add_data_semantics(train)
     add_runtime(train)
     add_model(train)
+    add_early_stopping(train)
     train.set_defaults(func=train_command)
 
     evaluate = commands.add_parser("evaluate")
@@ -1856,7 +2268,7 @@ def parser() -> argparse.ArgumentParser:
     )
     add_data_root(evaluate)
     add_data_semantics(evaluate, optional=True)
-    add_runtime(evaluate)
+    add_runtime(evaluate, batch_size=64)
     evaluate.set_defaults(func=evaluate_command)
 
     interpolation = commands.add_parser("interpolate")
@@ -1868,8 +2280,8 @@ def parser() -> argparse.ArgumentParser:
     interpolation.add_argument("--temporal", choices=["linear", "nearest"], default="linear")
     interpolation.add_argument("--max-samples", type=int)
     interpolation.add_argument("--output", default="runs/interpolation_result.json")
-    interpolation.add_argument("--workers", type=int, default=0)
-    interpolation.add_argument("--batch-size", type=int, default=8)
+    interpolation.add_argument("--workers", type=int, default=8)
+    interpolation.add_argument("--batch-size", type=int, default=64)
     add_data_root(interpolation)
     add_data_semantics(interpolation)
     interpolation.set_defaults(func=interpolation_command)
@@ -1886,8 +2298,8 @@ def parser() -> argparse.ArgumentParser:
     ridge.add_argument("--max-test", type=int)
     ridge.add_argument("--test", action="store_true")
     ridge.add_argument("--output", default="runs/ridge_result.json")
-    ridge.add_argument("--workers", type=int, default=0)
-    ridge.add_argument("--batch-size", type=int, default=2)
+    ridge.add_argument("--workers", type=int, default=8)
+    ridge.add_argument("--batch-size", type=int, default=64)
     add_data_root(ridge)
     add_data_semantics(ridge)
     ridge.set_defaults(func=ridge_command)
@@ -1897,7 +2309,7 @@ def parser() -> argparse.ArgumentParser:
     joint.add_argument("--obs-times", type=ints, default=(0, 1))
     joint.add_argument("--epochs", type=int, default=100)
     joint.add_argument("--steps-per-epoch", type=int)
-    joint.add_argument("--eval-batch-size", type=int, default=2)
+    joint.add_argument("--eval-batch-size", type=int, default=64)
     joint.add_argument("--learning-rate", type=float, default=2e-4)
     joint.add_argument("--weight-decay", type=float, default=1e-5)
     joint.add_argument("--seed", type=int, default=123)
@@ -1914,6 +2326,18 @@ def parser() -> argparse.ArgumentParser:
     tune.add_argument("--strategy", choices=["grid", "random"], default="random")
     tune.add_argument("--max-trials", type=int, default=12)
     tune.add_argument("--search-seed", type=int, default=2026)
+    tune.add_argument(
+        "--round1-epochs",
+        type=int,
+        default=25,
+        help="Epoch budget for every candidate before validation ranking.",
+    )
+    tune.add_argument(
+        "--promote-top-k",
+        type=int,
+        default=3,
+        help="Number of round-1 candidates resumed to --epochs.",
+    )
     tune.add_argument("--hidden-values", type=ints, default=(48, 64, 96))
     tune.add_argument("--graph-layer-values", type=ints, default=(1, 2, 3))
     tune.add_argument("--head-values", type=ints, default=(4, 8))
