@@ -29,3 +29,9 @@
 本地 41 项回归测试运行到 100%，未出现断言失败，另已通过语法和 JSON 完整性检查。本机 pytest 在显示 100% 后存在 Windows 解释器退出挂起，因而人工终止空转进程。正式实验前仍需在服务器完成真实数据 audit、语义验证和 CUDA smoke。
 
 joint training 的完整 resume/RNG/recovery 机制属于条件项：只有在 joint training 确认进入论文正式结果后再补齐。
+
+## 服务器 CUDA resume 补丁
+
+真实服务器验证发现：checkpoint 使用 `map_location=cuda` 加载时，CPU RNG 和 DataLoader generator 的状态 tensor 也会被搬到 GPU，旧实现随后把 CUDA tensor 直接交给只接受 CPU ByteTensor 的 PyTorch RNG 接口。现在 `restore_rng_state()` 会对 CPU RNG、CUDA RNG 状态列表和 DataLoader generator 状态逐项执行类型检查，并显式恢复为 contiguous CPU `uint8` tensor。该补丁只影响 resume 的 RNG 恢复路径，不改变模型权重或 optimizer state 的加载策略。
+
+新增 CUDA-only 回归测试覆盖真实 `map_location=cuda` 场景，并增加可在 CPU CI 中执行的 dtype 归一化与错误类型测试。此前已通过的 audit、数据语义验证和四个 CUDA smoke 无需重跑；服务器只需基于新 commit 重新验证 history recovery 后能够继续训练到下一 epoch，并确认 `resume_commands.log` 正常生成。

@@ -295,7 +295,7 @@ python main.py train ... \
   --run-name <run>
 ```
 
-Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random states. They are written to a temporary file and atomically replace the final checkpoint only after serialization succeeds. Resume configuration is validated before training continues. If `training_history.csv` is ahead of the selected checkpoint (for example, after an interrupted save), it is truncated to the matching checkpoint epoch and the repair is recorded in `recovery.log`; missing, duplicated, unordered, or irreconcilable history still fails loudly.
+Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random states. They are written to a temporary file and atomically replace the final checkpoint only after serialization succeeds. During resume, RNG tensors are explicitly normalized to contiguous CPU byte tensors before being passed to the PyTorch RNG APIs; this remains correct even when the full checkpoint is loaded with `map_location=cuda`. Resume configuration is validated before training continues. If `training_history.csv` is ahead of the selected checkpoint (for example, after an interrupted save), it is truncated to the matching checkpoint epoch and the repair is recorded in `recovery.log`; missing, duplicated, unordered, or irreconcilable history still fails loudly.
 
 ## Models and protocols included
 
