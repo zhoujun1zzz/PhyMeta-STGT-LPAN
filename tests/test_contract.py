@@ -603,6 +603,53 @@ def test_rng_state_round_trip() -> None:
     assert torch.equal(torch.randperm(10, generator=generator), expected_loader)
 
 
+def test_rng_restore_normalizes_cpu_and_generator_states_to_byte() -> None:
+    generator = torch.Generator().manual_seed(17)
+    state = capture_rng_state({"train": generator})
+    expected_global = torch.rand(4)
+    expected_loader = torch.randperm(10, generator=generator)
+    state["torch_cpu"] = state["torch_cpu"].to(torch.int16)
+    loader_states = state["loader_generators"]
+    assert isinstance(loader_states, dict)
+    loader_states["train"] = loader_states["train"].to(torch.int16)
+
+    restored_generator = torch.Generator()
+    restore_rng_state(state, {"train": restored_generator})
+
+    assert torch.equal(torch.rand(4), expected_global)
+    assert torch.equal(
+        torch.randperm(10, generator=restored_generator), expected_loader
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA required for RNG map-location regression test",
+)
+def test_restore_rng_state_after_cuda_checkpoint_load(tmp_path: Path) -> None:
+    generator = torch.Generator().manual_seed(123)
+    state = capture_rng_state({"train": generator})
+    path = tmp_path / "rng_checkpoint.pth"
+    torch.save({"rng_state": state}, path)
+    loaded = torch.load(path, map_location="cuda", weights_only=False)
+    loaded_state = loaded["rng_state"]
+    assert loaded_state["torch_cpu"].is_cuda
+    assert loaded_state["loader_generators"]["train"].is_cuda
+
+    restored_generator = torch.Generator()
+    restore_rng_state(loaded_state, {"train": restored_generator})
+
+    assert torch.get_rng_state().device.type == "cpu"
+    assert restored_generator.get_state().device.type == "cpu"
+
+
+def test_rng_restore_rejects_nontensor_state() -> None:
+    state = capture_rng_state()
+    state["torch_cpu"] = "not-a-tensor"
+    with pytest.raises(TypeError, match="torch_cpu RNG state must be a tensor"):
+        restore_rng_state(state)
+
+
 def test_cli_resume_keeps_history_and_rng_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

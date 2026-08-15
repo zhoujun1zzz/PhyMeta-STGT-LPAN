@@ -219,15 +219,41 @@ def restore_rng_state(
 ) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
+    torch_cpu_state = state["torch_cpu"]
+    if not isinstance(torch_cpu_state, torch.Tensor):
+        raise TypeError("torch_cpu RNG state must be a tensor.")
+    torch.set_rng_state(
+        torch_cpu_state.detach().cpu().to(dtype=torch.uint8).contiguous()
+    )
     cuda_state = state.get("torch_cuda")
     if cuda_state is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(cuda_state)
+        if not isinstance(cuda_state, (list, tuple)):
+            raise TypeError("torch_cuda RNG state must be a list or tuple.")
+        normalized_cuda_state = []
+        for index, item in enumerate(cuda_state):
+            if not isinstance(item, torch.Tensor):
+                raise TypeError(
+                    f"torch_cuda RNG state at index {index} must be a tensor."
+                )
+            normalized_cuda_state.append(
+                item.detach().cpu().to(dtype=torch.uint8).contiguous()
+            )
+        torch.cuda.set_rng_state_all(normalized_cuda_state)
     saved_generators = state.get("loader_generators", {})
     if loader_generators and isinstance(saved_generators, Mapping):
         for name, generator in loader_generators.items():
             if name in saved_generators:
-                generator.set_state(saved_generators[name])
+                generator_state = saved_generators[name]
+                if not isinstance(generator_state, torch.Tensor):
+                    raise TypeError(
+                        f"Generator RNG state for {name!r} must be a tensor."
+                    )
+                generator.set_state(
+                    generator_state.detach()
+                    .cpu()
+                    .to(dtype=torch.uint8)
+                    .contiguous()
+                )
 
 
 def write_json(path: Path, value: object) -> None:
