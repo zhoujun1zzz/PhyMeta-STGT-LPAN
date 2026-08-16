@@ -130,6 +130,7 @@ class FormalPipeline:
             },
             "formal_seeds": list(SEEDS),
             "joint_training_in_main_protocol": False,
+            "resume_safe_orchestration": True,
         }
 
     def save_state(self) -> None:
@@ -145,6 +146,9 @@ class FormalPipeline:
         assert isinstance(steps, dict)
         outputs = [Path(path).resolve() for path in expected_outputs]
         previous = steps.get(name)
+        argument_list = [str(value) for value in arguments]
+        command_name = argument_list[0] if argument_list else None
+
         if (
             isinstance(previous, dict)
             and previous.get("status") == "completed"
@@ -152,11 +156,84 @@ class FormalPipeline:
         ):
             print(f"[skip] {name}", flush=True)
             return
+
+        if (
+            command_name in {"train", "tune", "ablate"}
+            and all(path.is_file() for path in outputs)
+        ):
+            steps[name] = {
+                "status": "completed",
+                "outputs": [str(path) for path in outputs],
+                "recovered_from_outputs": True,
+                "finished_at": time.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ),
+            }
+            self.save_state()
+            print(
+                f"[recover-complete] {name}",
+                flush=True,
+            )
+            return
+
+        if (
+            command_name == "train"
+            and "--resume" not in argument_list
+        ):
+            def option_value(option: str) -> str | None:
+                try:
+                    index = argument_list.index(option)
+                except ValueError:
+                    return None
+
+                if index + 1 >= len(argument_list):
+                    return None
+
+                return argument_list[index + 1]
+
+            output_root = option_value("--output-root")
+            run_name = option_value("--run-name")
+
+            if output_root is not None and run_name is not None:
+                run_dir = Path(output_root) / run_name
+                last_checkpoint = (
+                    run_dir
+                    / "checkpoints"
+                    / "last_checkpoint.pth"
+                )
+
+                if last_checkpoint.is_file():
+                    argument_list.extend(
+                        [
+                            "--resume",
+                            str(last_checkpoint.resolve()),
+                        ]
+                    )
+                    print(
+                        f"[resume] {name} from "
+                        f"{last_checkpoint}",
+                        flush=True,
+                    )
+
+                elif run_dir.exists():
+                    orphan = run_dir.with_name(
+                        f"{run_dir.name}."
+                        "interrupted_no_checkpoint_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}"
+                    )
+                    run_dir.rename(orphan)
+
+                    print(
+                        f"[restart] preserved {orphan}; "
+                        f"no checkpoint existed for {name}",
+                        flush=True,
+                    )
+
         command = [
             self.python,
             "-u",
             str(PROJECT / "main.py"),
-            *(str(value) for value in arguments),
+            *argument_list,
         ]
         log_path = self.logs / f"{name}.log"
         steps[name] = {

@@ -534,11 +534,19 @@ def benchmark_batch_command(args: argparse.Namespace) -> dict[str, object]:
                 }
             )
         except RuntimeError as exc:
-            if "out of memory" not in str(exc).lower():
+            message = str(exc).lower()
+            if "out of memory" in message:
+                status = "oom"
+            elif (
+                device.type == "cuda"
+                and "invalid configuration argument" in message
+            ):
+                status = "cuda_configuration_error"
+            else:
                 raise
             row.update(
                 {
-                    "status": "oom",
+                    "status": status,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
@@ -1116,6 +1124,112 @@ def _study_trial_args(
     return argparse.Namespace(**values)
 
 
+def _prepare_resumable_study(
+    study_dir: Path,
+    plan_name: str,
+    plan: dict[str, object],
+) -> None:
+    """Create a study or validate the plan of an interrupted study."""
+    normalized_plan = json.loads(
+        json.dumps(
+            plan,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    )
+    plan_path = study_dir / plan_name
+
+    if study_dir.exists():
+        if not plan_path.is_file():
+            raise RuntimeError(
+                f"Existing study directory has no {plan_name}: "
+                f"{study_dir}"
+            )
+
+        existing = json.loads(
+            plan_path.read_text(encoding="utf-8")
+        )
+
+        if existing != normalized_plan:
+            raise RuntimeError(
+                "Refusing to resume a study whose recorded plan "
+                f"differs from the requested plan: {study_dir}"
+            )
+        return
+
+    study_dir.mkdir(parents=True)
+    write_json(plan_path, normalized_plan)
+
+
+def _run_or_resume_study_trial(
+    args: argparse.Namespace,
+    study_dir: Path,
+    run_name: str,
+    **overrides: object,
+) -> dict[str, object]:
+    """Reuse a completed trial or resume its exact last checkpoint."""
+
+    trial_args = _study_trial_args(
+        args,
+        study_dir,
+        run_name,
+        **overrides,
+    )
+
+    run_dir = Path(str(trial_args.output_root)) / run_name
+    result_path = run_dir / "results" / "final_result.json"
+
+    expected_epochs = (
+        int(getattr(trial_args, "smoke_epochs_override", 1))
+        if trial_args.mode == "smoke"
+        else int(trial_args.epochs)
+    )
+
+    if result_path.is_file():
+        result = json.loads(
+            result_path.read_text(encoding="utf-8")
+        )
+
+        if int(result.get("max_epochs", -1)) == expected_epochs:
+            print(f"[reuse] completed trial {run_name}")
+            return {
+                "run_dir": str(run_dir),
+                "result": result,
+                "recovery": "reused_completed",
+            }
+
+    last_checkpoint = (
+        run_dir / "checkpoints" / "last_checkpoint.pth"
+    )
+
+    if last_checkpoint.is_file():
+        print(
+            f"[resume] trial {run_name} from "
+            f"{last_checkpoint}"
+        )
+        trial_args.resume = str(last_checkpoint)
+        outcome = train_command(trial_args)
+        outcome["recovery"] = "resumed_checkpoint"
+        return outcome
+
+    if run_dir.exists():
+        orphan = run_dir.with_name(
+            f"{run_dir.name}.interrupted_no_checkpoint_"
+            f"{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        run_dir.rename(orphan)
+
+        print(
+            f"[restart] preserved non-resumable partial run "
+            f"as {orphan}"
+        )
+
+    outcome = train_command(trial_args)
+    outcome["recovery"] = "started_from_scratch"
+    return outcome
+
+
 def two_round_tune_command(args: argparse.Namespace) -> dict[str, object]:
     """Run validation-only successive-halving style hyperparameter search."""
 
@@ -1456,15 +1570,15 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
     stamp = time.strftime("%Y%m%d_%H%M%S")
     study_name = args.study_name or f"targeted_{args.domain}_{stamp}"
     study_dir = Path(args.output_root) / study_name
-    if study_dir.exists():
-        raise FileExistsError(
-            f"Study directory already exists; choose another --study-name: {study_dir}"
-        )
+    _prepare_resumable_study(
+        study_dir,
+        "search_plan.json",
+        plan,
+    )
     capacity_dir = study_dir / "capacity"
     learning_rate_dir = study_dir / "learning_rate"
-    capacity_dir.mkdir(parents=True)
-    learning_rate_dir.mkdir(parents=True)
-    write_json(study_dir / "search_plan.json", plan)
+    capacity_dir.mkdir(parents=True, exist_ok=True)
+    learning_rate_dir.mkdir(parents=True, exist_ok=True)
     study_started = time.perf_counter()
 
     capacity_plan = plan["capacity"]
@@ -1479,7 +1593,7 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
         run_name = f"trial_hidden_{int(hidden):03d}"
         trial_started = time.perf_counter()
         seed_everything(args.seed)
-        trial_args = _study_trial_args(
+        outcome = _run_or_resume_study_trial(
             args,
             capacity_dir,
             run_name,
@@ -1491,7 +1605,6 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
             hidden=int(hidden),
             **capacity_fixed,
         )
-        outcome = train_command(trial_args)
         result = outcome["result"]
         assert isinstance(result, dict)
         history = result["history"]
@@ -1505,6 +1618,7 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
             "status": "completed",
             "from_scratch": True,
             "resume": None,
+            "recovery": outcome.get("recovery", "unknown"),
             "epochs_completed": result["epochs_completed"],
             "best_validation_nmse_linear_up_to_budget": result[
                 "best_validation_nmse_linear"
@@ -1542,7 +1656,7 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
         run_name = f"trial_lr_{label}"
         trial_started = time.perf_counter()
         seed_everything(args.seed)
-        trial_args = _study_trial_args(
+        outcome = _run_or_resume_study_trial(
             args,
             learning_rate_dir,
             run_name,
@@ -1555,9 +1669,6 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
             learning_rate=float(learning_rate),
             **lr_fixed,
         )
-        if trial_args.resume is not None:
-            raise AssertionError("Learning-rate trials must start from scratch.")
-        outcome = train_command(trial_args)
         result = outcome["result"]
         assert isinstance(result, dict)
         history = result["history"]
@@ -1572,6 +1683,7 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
             "status": "completed",
             "from_scratch": True,
             "resume": None,
+            "recovery": outcome.get("recovery", "unknown"),
             "epochs_completed": result["epochs_completed"],
             "best_validation_nmse_linear_up_to_budget": result[
                 "best_validation_nmse_linear"
@@ -1607,32 +1719,62 @@ def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object
     if not source_last.is_file():
         raise FileNotFoundError(f"Winning last checkpoint is missing: {source_last}")
     final_dir = study_dir / "final"
-    shutil.copytree(source_run, final_dir)
+
+    if not final_dir.exists():
+        shutil.copytree(source_run, final_dir)
+
     final_last = final_dir / "checkpoints" / "last_checkpoint.pth"
     final_plan = plan["final"]
     assert isinstance(final_plan, dict)
     final_max_epochs = int(final_plan["max_epochs"])
-    seed_everything(args.seed)
-    final_args = _study_trial_args(
-        args,
-        study_dir,
-        "final",
-        epochs=final_max_epochs,
-        smoke_epochs_override=final_max_epochs,
-        resume=str(final_last),
-        early_stopping=True,
-        min_epochs=40,
-        patience=15,
-        hidden=selected_hidden,
-        graph_layers=2,
-        heads=4,
-        dropout=0.0,
-        learning_rate=float(winner["learning_rate"]),
-        weight_decay=0.0,
+
+    final_result_path = (
+        final_dir / "results" / "final_result.json"
     )
-    final_outcome = train_command(final_args)
-    final_result = final_outcome["result"]
-    assert isinstance(final_result, dict)
+    final_result: dict[str, object] | None = None
+
+    if final_result_path.is_file():
+        candidate = json.loads(
+            final_result_path.read_text(encoding="utf-8")
+        )
+        if int(candidate.get("max_epochs", -1)) == final_max_epochs:
+            print("[reuse] completed targeted final continuation")
+            final_result = candidate
+
+    if final_result is None:
+        if not final_last.is_file():
+            raise FileNotFoundError(
+                f"Final resume checkpoint is missing: {final_last}"
+            )
+
+        print(
+            "[resume] targeted final continuation from "
+            f"{final_last}"
+        )
+
+        seed_everything(args.seed)
+
+        final_args = _study_trial_args(
+            args,
+            study_dir,
+            "final",
+            epochs=final_max_epochs,
+            smoke_epochs_override=final_max_epochs,
+            resume=str(final_last),
+            early_stopping=True,
+            min_epochs=40,
+            patience=15,
+            hidden=selected_hidden,
+            graph_layers=2,
+            heads=4,
+            dropout=0.0,
+            learning_rate=float(winner["learning_rate"]),
+            weight_decay=0.0,
+        )
+
+        final_outcome = train_command(final_args)
+        final_result = final_outcome["result"]
+        assert isinstance(final_result, dict)
     boundary_hit = {
         "hidden_upper": selected_hidden == 160,
         "learning_rate_upper": float(winner["learning_rate"]) == 1e-3,
@@ -1863,22 +2005,37 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     stamp = time.strftime("%Y%m%d_%H%M%S")
     study_name = args.study_name or f"ablation_{args.domain}_{stamp}"
     study_dir = Path(args.output_root) / study_name
-    if study_dir.exists():
-        raise FileExistsError(
-            f"Study directory already exists; choose another --study-name: {study_dir}"
-        )
-    study_dir.mkdir(parents=True)
+
+    ablation_plan = {
+        "domain": args.domain,
+        "mode": args.mode,
+        "seed": args.seed,
+        "variants": list(variants),
+        "epochs": 1 if args.mode == "smoke" else args.epochs,
+        "min_epochs": args.min_epochs,
+        "patience": args.patience,
+        "early_stopping": bool(args.early_stopping),
+        "batch_size": args.batch_size,
+        "eval_batch_size": args.eval_batch_size,
+        "fraction": args.fraction,
+        "best_result": (
+            str(Path(args.best_result).resolve())
+            if args.best_result is not None
+            else None
+        ),
+        "inherited_hyperparameters": inherited_hyperparameters,
+    }
+
+    _prepare_resumable_study(
+        study_dir,
+        "ablation_plan.json",
+        ablation_plan,
+    )
+
     rows: list[dict[str, object]] = []
     for index, variant in enumerate(variants):
         seed_everything(args.seed)
         run_name = f"ablation_{index:02d}_{variant}"
-        trial_args = _study_trial_args(
-            args,
-            study_dir,
-            run_name,
-            **inherited_hyperparameters,
-            ablation=variant,
-        )
         row: dict[str, object] = {
             "order": index,
             "variant": variant,
@@ -1886,7 +2043,13 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "run_name": run_name,
         }
         try:
-            outcome = train_command(trial_args)
+            outcome = _run_or_resume_study_trial(
+                args,
+                study_dir,
+                run_name,
+                **inherited_hyperparameters,
+                ablation=variant,
+            )
             result = outcome["result"]
             assert isinstance(result, dict)
             row.update(
