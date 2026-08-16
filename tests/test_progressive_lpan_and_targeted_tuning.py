@@ -194,6 +194,45 @@ def test_progressive_model_uses_unified_evaluator_and_profiler() -> None:
     assert result["total"] > 0
 
 
+@pytest.mark.parametrize(
+    "model,expected_parameters,expected_macs",
+    [
+        (
+            ProgressiveLPAN(
+                2, 6, lightweight=False, domain="mobility", channels=96
+            ),
+            2_394_300,
+            12_228_931_584,
+        ),
+        (
+            ProgressiveLPAN(
+                2, 6, lightweight=True, domain="mobility", channels=96
+            ),
+            1_112_904,
+            5_258_345_472,
+        ),
+        (
+            build_model(
+                "phymeta_stgt",
+                domain="mobility",
+                hidden=64,
+                graph_layers=2,
+                heads=4,
+            ),
+            188_360,
+            113_828_352,
+        ),
+    ],
+)
+def test_same_condition_mobility_complexity_smoke(
+    model: torch.nn.Module, expected_parameters: int, expected_macs: int
+) -> None:
+    report = profile_model_complexity(model, canonical_batch("mobility"))
+    assert report["total_parameters"] == expected_parameters
+    assert report["macs"] == expected_macs
+    assert report["flops"] == 2 * expected_macs
+
+
 def test_targeted_search_plan_and_linear_late_window() -> None:
     args = experiment_main.parser().parse_args(
         ["tune", "--domain", "mobility", "--mode", "full", "--tuning-protocol", "targeted_boundary"]
