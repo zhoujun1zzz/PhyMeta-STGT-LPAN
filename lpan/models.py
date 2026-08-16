@@ -408,7 +408,9 @@ class LPANFeatureStage(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for block in self.blocks:
             x = block(x)
-        return self.refine(F.interpolate(x, scale_factor=2, mode="nearest"))
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
 
 
 class LPANLFeatureStage(nn.Module):
@@ -430,7 +432,9 @@ class LPANLFeatureStage(nn.Module):
         x = self.grouped_block(x)
         for block in self.ordinary_blocks:
             x = block(x)
-        return self.refine(F.interpolate(x, scale_factor=2, mode="nearest"))
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
 
 
 class LPANLFinalFeatureStage(nn.Module):
@@ -447,7 +451,9 @@ class LPANLFinalFeatureStage(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.grouped_block(x)
-        return self.refine(F.interpolate(x, scale_factor=2, mode="nearest"))
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
 
 
 class ProgressiveReconstruction(nn.Module):
@@ -461,7 +467,9 @@ class ProgressiveReconstruction(nn.Module):
         self.skip = nn.Conv2d(input_channels, output_channels, 3, padding=1)
 
     def forward(self, features: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
-        previous = F.interpolate(previous, scale_factor=2, mode="nearest")
+        previous = F.interpolate(
+            previous, scale_factor=(1, 2), mode="nearest"
+        )
         return self.feature(features) + self.skip(previous)
 
 

@@ -130,7 +130,13 @@ def test_block_fidelity_and_public_loop_equivalence() -> None:
     assert quasi.reconstruction_stages[1] is not quasi.reconstruction_stages[2]
     assert mobility.reconstruction_stages[0] is not mobility.reconstruction_stages[1]
     assert mobility.reconstruction_stages[1] is mobility.reconstruction_stages[2]
-    assert sum(parameter.numel() for parameter in mobility.parameters()) == 1_112_904
+    official_mobility = ProgressiveLPAN(
+        2, 6, lightweight=True, domain="mobility", channels=96
+    )
+    assert (
+        sum(parameter.numel() for parameter in official_mobility.parameters())
+        == 1_112_904
+    )
 
 
 @pytest.mark.parametrize("domain,obs_blocks,query_blocks", [("quasi", 1, 1), ("mobility", 2, 6)])
