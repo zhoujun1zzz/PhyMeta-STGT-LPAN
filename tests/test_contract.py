@@ -12,6 +12,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import main as experiment_main
+import lpan.models as model_module
 
 from lpan.data import LPANH5Dataset, default_observed_ris_indices
 from lpan.complexity import canonical_batch, profile_model_complexity
@@ -25,8 +26,10 @@ from lpan.engine import (
 )
 from lpan.metrics import MetricAccumulator
 from lpan.models import (
+    LPANLResidualBlock,
     build_model,
     expand_observations_to_grid,
+    grid_aware_spatial_interpolation_weights,
     interpolation_baseline,
 )
 from lpan.objectives import (
@@ -92,6 +95,68 @@ def collate_sample(domain: str) -> dict[str, torch.Tensor]:
         "observation_mask": torch.ones(1, t, 32, dtype=torch.bool),
         "sample_index": torch.tensor([0]),
     }
+
+
+def reference_expand_observations_to_grid(
+    batch: dict[str, torch.Tensor],
+    *,
+    nearest: bool = False,
+) -> torch.Tensor:
+    """Pre-optimization implementation retained only as a regression oracle."""
+
+    obs = batch["obs_h"]
+    raw_index = batch["obs_ris_index"]
+    obs_index = (raw_index[0] if raw_index.ndim > 1 else raw_index).to(obs.device)
+    weights = grid_aware_spatial_interpolation_weights(
+        obs_index, nearest=nearest
+    ).to(obs.dtype)
+    raw_mask = batch.get("observation_mask")
+    if raw_mask is None:
+        return torch.einsum("np,btpmc->btnmc", weights, obs)
+    mask = raw_mask.to(device=obs.device, dtype=torch.bool)
+    if mask.ndim == 2:
+        mask = mask.unsqueeze(0)
+    if tuple(mask.shape) != tuple(obs.shape[:3]):
+        raise ValueError(
+            "observation_mask must match [batch, observed_time, observed_RIS]."
+        )
+    batches: list[torch.Tensor] = []
+    for batch_index in range(obs.shape[0]):
+        times: list[torch.Tensor] = []
+        for time_index in range(obs.shape[1]):
+            valid_positions = torch.where(mask[batch_index, time_index])[0]
+            if valid_positions.numel() == 0:
+                raise ValueError(
+                    "Every (sample, observed_time) must contain at least one "
+                    "valid observation."
+                )
+            valid_indices = obs_index.index_select(0, valid_positions)
+            local_weights = grid_aware_spatial_interpolation_weights(
+                valid_indices, nearest=nearest
+            ).to(obs.dtype)
+            valid_observations = obs[batch_index, time_index].index_select(
+                0, valid_positions
+            )
+            times.append(
+                torch.einsum("np,pmc->nmc", local_weights, valid_observations)
+            )
+        batches.append(torch.stack(times, dim=0))
+    return torch.stack(batches, dim=0)
+
+
+def repeat_observation_batch(
+    batch: dict[str, torch.Tensor], batch_size: int
+) -> dict[str, torch.Tensor]:
+    repeated = dict(batch)
+    for key in ("obs_h", "observation_mask", "obs_ris_index"):
+        value = batch[key]
+        repeated[key] = value.expand(batch_size, *value.shape[1:]).clone()
+    return repeated
+
+
+def assert_exact_tensor(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    max_abs_error = float((actual - expected).detach().abs().max())
+    assert torch.equal(actual, expected), f"max_abs_error={max_abs_error:.9g}"
 
 
 def test_hdf5_contract(tmp_path: Path) -> None:
@@ -194,7 +259,36 @@ def test_lpan_l_direct_is_single_stage_32_to_256() -> None:
     prediction = model(batch)
     assert prediction.shape == (1, 6, 256, 64, 2)
     assert model.target_nodes == 256
+    assert len(model.body) == 3
+    assert [block.grouped for block in model.body] == [True, False, False]
     assert not any(isinstance(module, torch.nn.Upsample) for module in model.modules())
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_lpan_l_residual_block_matches_official_activation_formula(
+    grouped: bool,
+) -> None:
+    class Multiply(torch.nn.Module):
+        def __init__(self, factor: float) -> None:
+            super().__init__()
+            self.factor = factor
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value * self.factor
+
+    block = LPANLResidualBlock(1, grouped=grouped)
+    block.conv1 = torch.nn.Identity()
+    block.conv2 = torch.nn.Identity()
+    block.project = Multiply(2.0) if grouped else torch.nn.Identity()
+    block.attention = Multiply(3.0)
+    inputs = torch.tensor([[[[-2.0, 1.0]]]])
+    first = block.activation(block.conv1(inputs))
+    second = block.conv2(first)
+    if grouped:
+        second = block.activation(second)
+        second = block.project(second)
+    expected = inputs + block.attention(second)
+    assert_exact_tensor(block(inputs), expected)
 
 
 def test_lpan_l_direct_rejects_nonofficial_geometry_and_ambiguous_alias() -> None:
@@ -536,6 +630,110 @@ def test_cnn_grid_expansion_respects_observed_indices() -> None:
     full = expand_observations_to_grid(batch)
     indices = batch["obs_ris_index"][0]
     assert torch.equal(full.index_select(2, indices), batch["obs_h"])
+
+
+@pytest.mark.parametrize("domain", ["quasi", "mobility"])
+@pytest.mark.parametrize("nearest", [False, True])
+def test_grid_expansion_all_true_fast_path_matches_reference_and_autograd(
+    domain: str,
+    nearest: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = repeat_observation_batch(collate_sample(domain), batch_size=3)
+    batch["obs_h"].requires_grad_()
+    expected = reference_expand_observations_to_grid(batch, nearest=nearest)
+    original = model_module.grid_aware_spatial_interpolation_weights
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        model_module, "grid_aware_spatial_interpolation_weights", counted
+    )
+    actual = expand_observations_to_grid(batch, nearest=nearest)
+    assert_exact_tensor(actual, expected)
+    assert calls == 1
+    actual.square().mean().backward()
+    assert batch["obs_h"].grad is not None
+    assert torch.isfinite(batch["obs_h"].grad).all()
+
+
+def test_grid_expansion_without_mask_uses_shared_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = repeat_observation_batch(collate_sample("quasi"), batch_size=2)
+    del batch["observation_mask"]
+    original = model_module.grid_aware_spatial_interpolation_weights
+    calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        model_module, "grid_aware_spatial_interpolation_weights", counted
+    )
+    actual = expand_observations_to_grid(batch)
+    assert calls == 1
+    assert actual.shape == (2, 1, 256, 64, 2)
+
+
+@pytest.mark.parametrize("nearest", [False, True])
+def test_grid_expansion_partial_mask_matches_reference(nearest: bool) -> None:
+    batch = repeat_observation_batch(collate_sample("mobility"), batch_size=2)
+    batch["observation_mask"][0, 0, 0] = False
+    batch["observation_mask"][0, 1, 1] = False
+    batch["observation_mask"][1, :, 4] = False
+    expected = reference_expand_observations_to_grid(batch, nearest=nearest)
+    actual = expand_observations_to_grid(batch, nearest=nearest)
+    assert_exact_tensor(actual, expected)
+
+
+def test_grid_expansion_preserves_mask_errors() -> None:
+    wrong_shape = collate_sample("quasi")
+    wrong_shape["observation_mask"] = torch.ones(1, 31, dtype=torch.bool)
+    with pytest.raises(ValueError, match="must match"):
+        expand_observations_to_grid(wrong_shape)
+
+    empty_time = collate_sample("mobility")
+    empty_time["observation_mask"][:, 1].zero_()
+    with pytest.raises(ValueError, match="at least one valid observation"):
+        expand_observations_to_grid(empty_time)
+
+    missing_row = collate_sample("quasi")
+    missing_row["observation_mask"][:, :, :2].zero_()
+    with pytest.raises(ValueError, match="RIS row 0"):
+        expand_observations_to_grid(missing_row)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "domain"),
+    [("edsr_lite", "quasi"), ("cnn_gru", "mobility")],
+)
+def test_interpolation_models_match_preoptimization_outputs(
+    model_name: str,
+    domain: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(2026)
+    model = build_model(
+        model_name, domain=domain, hidden=16, graph_layers=1, heads=4
+    ).eval()
+    batch = collate_sample(domain)
+    with torch.inference_mode():
+        optimized = model(batch)
+    monkeypatch.setattr(
+        model_module,
+        "expand_observations_to_grid",
+        reference_expand_observations_to_grid,
+    )
+    with torch.inference_mode():
+        reference = model(batch)
+    assert_exact_tensor(optimized, reference)
 
 
 def test_grid_aware_interpolation_never_crosses_ris_rows() -> None:
