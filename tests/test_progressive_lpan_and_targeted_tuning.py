@@ -37,6 +37,29 @@ def test_progressive_models_are_registered_without_relabeling_direct() -> None:
 
 
 @pytest.mark.parametrize(
+    "domain,lightweight,expected",
+    [
+        ("quasi", False, 2_363_646),
+        ("mobility", False, 2_394_300),
+        ("quasi", True, 1_092_180),
+        ("mobility", True, 1_112_904),
+    ],
+)
+def test_official_width_parameter_counts(
+    domain: str, lightweight: bool, expected: int
+) -> None:
+    obs_blocks, query_blocks = (1, 1) if domain == "quasi" else (2, 6)
+    model = ProgressiveLPAN(
+        obs_blocks,
+        query_blocks,
+        lightweight=lightweight,
+        domain=domain,
+        channels=96,
+    )
+    assert sum(parameter.numel() for parameter in model.parameters()) == expected
+
+
+@pytest.mark.parametrize(
     ("domain", "obs_blocks", "query_blocks", "expected"),
     [
         ("quasi", 1, 1, ((1, 1, 64, 64, 2), (1, 1, 128, 64, 2), (1, 1, 256, 64, 2))),
@@ -130,13 +153,6 @@ def test_block_fidelity_and_public_loop_equivalence() -> None:
     assert quasi.reconstruction_stages[1] is not quasi.reconstruction_stages[2]
     assert mobility.reconstruction_stages[0] is not mobility.reconstruction_stages[1]
     assert mobility.reconstruction_stages[1] is mobility.reconstruction_stages[2]
-    official_mobility = ProgressiveLPAN(
-        2, 6, lightweight=True, domain="mobility", channels=96
-    )
-    assert (
-        sum(parameter.numel() for parameter in official_mobility.parameters())
-        == 1_112_904
-    )
 
 
 @pytest.mark.parametrize("domain,obs_blocks,query_blocks", [("quasi", 1, 1), ("mobility", 2, 6)])
