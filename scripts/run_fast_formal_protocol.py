@@ -25,10 +25,13 @@ WORKERS = 8
 MAX_EPOCHS = 100
 MIN_EPOCHS = 40
 PATIENCE = 15
-ROUND1_EPOCHS = 25
-PROMOTE_TOP_K = 3
 QUASI_BATCH_CANDIDATES = (16, 32, 64, 128)
-QUASI_MODELS = ("lpan_l_direct", "edsr_lite", "spatial_gcn")
+QUASI_MODELS = (
+    "lpan_progressive",
+    "lpan_l_progressive",
+    "edsr_lite",
+    "spatial_gcn",
+)
 MOBILITY_MODELS = QUASI_MODELS + ("cnn_gru", "gcn_gru")
 ALL_ABLATIONS = (
     "none",
@@ -117,11 +120,12 @@ class FormalPipeline:
             "min_epochs": MIN_EPOCHS,
             "patience": PATIENCE,
             "stage_b": {
-                "candidates": 12,
-                "round1_epochs": ROUND1_EPOCHS,
-                "promote_top_k": PROMOTE_TOP_K,
+                "protocol": "targeted_boundary",
+                "capacity_candidates": [96, 128, 160],
+                "capacity_epochs": 20,
+                "learning_rate_candidates": [5e-4, 8e-4, 1e-3],
+                "learning_rate_epochs": 40,
                 "final_max_epochs": MAX_EPOCHS,
-                "search_seed": 2026,
                 "training_seed": 123,
             },
             "formal_seeds": list(SEEDS),
@@ -247,11 +251,12 @@ class FormalPipeline:
         for domain in ("quasi", "mobility"):
             complexity = stage / f"{domain}_complexity.json"
             models = (
-                "lpan_l_direct,edsr_lite,spatial_gcn,phymeta_stgt"
+                "lpan_progressive,lpan_l_progressive,edsr_lite,"
+                "spatial_gcn,phymeta_stgt"
                 if domain == "quasi"
                 else (
-                    "lpan_l_direct,edsr_lite,spatial_gcn,cnn_gru,"
-                    "gcn_gru,phymeta_stgt"
+                    "lpan_progressive,lpan_l_progressive,edsr_lite,"
+                    "spatial_gcn,cnn_gru,gcn_gru,phymeta_stgt"
                 )
             )
             self.run_main(
@@ -314,7 +319,7 @@ class FormalPipeline:
         results: dict[str, Path] = {}
         for domain, batch in (("quasi", quasi_batch), ("mobility", MOBILITY_BATCH)):
             study_root = self.root / "stage_b"
-            study_name = f"{domain}_two_round_search"
+            study_name = f"{domain}_targeted_boundary_search"
             best = study_root / study_name / "best_result.json"
             self.run_main(
                 f"stage_b_{domain}",
@@ -324,16 +329,8 @@ class FormalPipeline:
                     domain,
                     "--mode",
                     "full",
-                    "--strategy",
-                    "random",
-                    "--max-trials",
-                    12,
-                    "--search-seed",
-                    2026,
-                    "--round1-epochs",
-                    ROUND1_EPOCHS,
-                    "--promote-top-k",
-                    PROMOTE_TOP_K,
+                    "--tuning-protocol",
+                    "targeted_boundary",
                     "--epochs",
                     MAX_EPOCHS,
                     "--min-epochs",
@@ -423,8 +420,6 @@ class FormalPipeline:
         manifest: list[dict[str, object]] = []
         for domain, batch in (("quasi", quasi_batch), ("mobility", MOBILITY_BATCH)):
             best_payload = read_json(best_results[domain])
-            best_trial = best_payload["best_trial"]
-            assert isinstance(best_trial, dict)
             manifest.append(
                 {
                     "id": f"{domain}_phymeta_stgt_seed123",
@@ -482,9 +477,14 @@ class FormalPipeline:
 
     def stage_d(self, quasi_batch: int) -> list[dict[str, object]]:
         manifest: list[dict[str, object]] = []
+        mobility_models = MOBILITY_MODELS
+        if self.args.exclude_mobility_adapted_lpan:
+            mobility_models = tuple(
+                model for model in mobility_models if model != "lpan_progressive"
+            )
         for domain, models, batch in (
             ("quasi", QUASI_MODELS, quasi_batch),
-            ("mobility", MOBILITY_MODELS, MOBILITY_BATCH),
+            ("mobility", mobility_models, MOBILITY_BATCH),
         ):
             for model in models:
                 for seed in SEEDS:
@@ -774,6 +774,11 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--output-root", default="runs/formal_fast")
     command.add_argument("--device", default="cuda")
     command.add_argument("--python", default=sys.executable)
+    command.add_argument(
+        "--exclude-mobility-adapted-lpan",
+        action="store_true",
+        help="Skip adapted Mobility LPAN; official Mobility LPAN-L remains enabled.",
+    )
     return command
 
 

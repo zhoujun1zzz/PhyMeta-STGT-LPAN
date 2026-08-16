@@ -156,6 +156,8 @@ Spatial interpolation is grid-aware and row-wise on the physical `16 x 16` RIS. 
 
 ```bash
 python main.py train --domain quasi --model edsr_lite --mode smoke
+python main.py train --domain quasi --model lpan_progressive --mode smoke
+python main.py train --domain quasi --model lpan_l_progressive --mode smoke
 python main.py train --domain quasi --model lpan_l_direct --mode smoke
 python main.py train --domain quasi --model spatial_gcn --mode smoke
 python main.py train --domain mobility --model cnn_gru --mode smoke
@@ -165,9 +167,32 @@ python main.py train --domain mobility --model phymeta_stgt --mode smoke
 
 Smoke mode uses 64 training samples, 16 validation samples, and one epoch. Its outputs are implementation checks, not reportable performance results.
 
-### LPAN-L-Direct baseline
+### Progressive LPAN and LPAN-L baselines
 
-`LPAN-L-Direct` (CLI key: `lpan_l_direct`) is an LPAN-L-derived comparison model adapted to this repository's task contract. It retains dilated residual processing and channel attention, but replaces the original progressive `32 -> 64 -> 128 -> 256` reconstruction with one direct `32 -> 256` resize-and-reconstruction stage. It accepts only the verified official input ordering `(0, 8, ..., 248)` and returns the final dense channel tensor, with shape `[B, 1, 256, 64, 2]` for quasi-static data and `[B, 6, 256, 64, 2]` for mobility data. The ambiguous `lpan_l` alias is intentionally unsupported.
+The main LPAN baselines are `lpan_progressive` (displayed as LPAN) and
+`lpan_l_progressive` (displayed as LPAN-L). Both execute the complete
+`32 -> 64 -> 128 -> 256` reconstruction path. Training preserves the public
+multi-scale targets at RIS indices `1::4`, `1::2`, and the full grid, using
+equal-weight FP32 Charbonnier losses. Validation, test, and complexity profiling
+continue to use only the final HR8 unified tensor. Mobility LPAN-L follows
+`Mobility_LPAN_L1.py`; Mobility LPAN is explicitly recorded as a channel-adapted
+LPAN architecture rather than an official time-varying model.
+
+```bash
+python main.py train --domain quasi --model lpan_progressive --mode full \
+  --epochs 100 --training-profile lpan_public_code
+python main.py train --domain mobility --model lpan_l_progressive --mode full \
+  --epochs 100 --training-profile lpan_public_code
+```
+
+The public LPAN-L same-input loops are mathematically redundant: each iteration
+overwrites the output with `block(x)`. The registered model evaluates the block
+once, records this equivalence in checkpoint metadata, and does not reinterpret
+the loop as recursive residual processing.
+
+### Supplementary LPAN-L-Direct baseline
+
+`LPAN-L-Direct` (CLI key: `lpan_l_direct`) is retained only as a supplementary task-adapted comparison. It is not used as the main LPAN-L baseline.
 
 ```bash
 python main.py train --domain quasi --model lpan_l_direct --mode full \
@@ -236,21 +261,21 @@ The `--pretrained` option accepts only a structurally compatible PhyMeta-STGT ch
 
 ### Hyperparameter search
 
-The `tune` command performs deterministic two-round multi-fidelity search using only the training and validation splits. In the formal protocol, all 12 seeded-random candidates train for 25 epochs, are ranked by their minimum sample-level linear validation NMSE, and the top three resume from their exact epoch-25 checkpoints to a maximum of 100 epochs. Checkpoint and DataLoader RNG states are preserved during promotion. This reduces the nominal per-domain budget from 1,200 to 525 epochs before early stopping. The test split is never read by this command.
+The historical `two_round_validation_promotion` protocol remains the default for
+reproducibility. The new formal protocol is `targeted_boundary`: it first trains
+hidden sizes 96/128/160 for a fixed 20 epochs at LR `5e-4`, ranks the epoch
+16--20 median in linear NMSE, then trains LR `5e-4`/`8e-4`/`1e-3` from scratch
+for 40 epochs at the selected hidden size and ranks the epoch 31--40 linear-NMSE
+median. Mean, standard deviation, and best validation NMSE are diagnostics. The
+winner resumes exactly from its epoch-40 `last_checkpoint.pth` to at most epoch
+100. The test split is never read.
 
 ```bash
 python main.py tune --domain mobility --mode full \
-  --strategy random --max-trials 12 --search-seed 2026 \
-  --round1-epochs 25 --promote-top-k 3 --epochs 100 \
+  --tuning-protocol targeted_boundary --epochs 100 \
   --batch-size 32 --eval-batch-size 64 --workers 8 \
   --min-epochs 40 --patience 15 \
-  --hidden-values 48,64,96 \
-  --graph-layer-values 1,2,3 \
-  --head-values 4,8 \
-  --dropout-values 0,0.1 \
-  --learning-rate-values 1e-4,2e-4,5e-4 \
-  --weight-decay-values 0,1e-5 \
-  --study-name mobility_hparam_seed123
+  --study-name mobility_targeted_boundary_seed123
 ```
 
 The selected configuration and checkpoint are written to `runs/<study_name>/best_result.json`; `search_plan.json`, `trials.csv`, and `trials.json` retain the round-1 ranking, promotion decisions, resume paths, and final ranking. A smoke search verifies only the round-1 plumbing and is not a reportable optimum.
@@ -259,7 +284,7 @@ The selected configuration and checkpoint are written to `runs/<study_name>/best
 
 Formal Mobility training uses batch size 32, evaluation batch size 64, eight DataLoader workers, FP32, `OMP_NUM_THREADS=1`, and `MKL_NUM_THREADS=1`. Quasi-static training selects one batch size from `16,32,64,128` using a non-reportable 1,024-sample throughput benchmark; the fastest configuration that does not OOM is frozen for all subsequent Quasi runs.
 
-Every independently trainable neural model—including PhyMeta-STGT, LPAN-L-Direct, and all trainable baselines—uses the same validation-only stopping rule: at most 100 epochs, at least 40 epochs, and patience 15 after the minimum epoch. The test split never participates. Runs retain the best checkpoint even when training stops early. Disable the rule only for an intentional diagnostic with `--no-early-stopping`.
+Every independently trainable neural model uses the same validation-only stopping rule: at most 100 epochs, at least 40 epochs, and patience 15 after the minimum epoch. Progressive LPAN models use their public-code-derived AdamW/cosine/multi-scale-loss profile while keeping this unified selection rule. The test split never participates.
 
 ### Parameters, GMACs, and GFLOPs
 
@@ -267,11 +292,11 @@ Use the built-in profiler to compare registered models under exactly the same do
 
 ```bash
 python main.py profile --domain mobility --batch-size 1 --device cpu \
-  --models lpan_l_direct,edsr_lite,spatial_gcn,cnn_gru,gcn_gru,phymeta_stgt \
+  --models lpan_progressive,lpan_l_progressive,edsr_lite,spatial_gcn,cnn_gru,gcn_gru,phymeta_stgt \
   --output runs/mobility_complexity.json
 
 python main.py profile --domain quasi --batch-size 1 --device cpu \
-  --models lpan_l_direct,edsr_lite,spatial_gcn,phymeta_stgt \
+  --models lpan_progressive,lpan_l_progressive,edsr_lite,spatial_gcn,phymeta_stgt \
   --output runs/quasi_complexity.json
 ```
 
@@ -302,7 +327,7 @@ Each result is selected independently on validation NMSE. `summary.json` records
 
 ### Automated fast formal pipeline
 
-The complete FP32 protocol is orchestrated by [`scripts/run_fast_formal_protocol.py`](scripts/run_fast_formal_protocol.py). It benchmarks the Quasi batch size, runs validation-only Stage A, executes two-round Stage B for both domains, runs three-seed PhyMeta and baseline studies, executes the Mobility ablations, freezes a checkpoint manifest, and only then opens the independent test split in Stage F. Each step has a separate log and an entry in `pipeline_state.json`; a failed command stops the pipeline without deleting completed artifacts.
+The complete FP32 protocol is orchestrated by [`scripts/run_fast_formal_protocol.py`](scripts/run_fast_formal_protocol.py). It benchmarks the Quasi batch size, runs validation-only Stage A, executes targeted-boundary Stage B independently for both domains, runs three-seed PhyMeta and progressive-baseline studies, executes the Mobility ablations, freezes a checkpoint manifest, and only then opens the independent test split in Stage F.
 
 ```bash
 export OMP_NUM_THREADS=1
@@ -329,15 +354,15 @@ Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random stat
 
 - LS coarse-channel interpolation;
 - empirical Ridge regression with validation-selected regularization;
-- LPAN-L-Direct, the task-adapted single-stage baseline (`lpan_l_direct`);
+- progressive LPAN and LPAN-L (`lpan_progressive`, `lpan_l_progressive`);
+- LPAN-L-Direct as a supplementary task-adapted baseline (`lpan_l_direct`);
 - EDSR-lite;
 - Spatial GCN;
 - CNN-GRU;
 - GCN-GRU; and
 - PhyMeta-STGT.
 
-`LPAN-L-Direct` is intentionally a task-adapted, single-stage LPAN-L-derived baseline and must not be labeled as an unchanged reproduction of the official progressive LPAN-L architecture.
-The official progressive LPAN-L is not a registered training option in this repository. Its source implementation is handled only by the separate validated profiling script and external baseline pipeline.
+`LPAN-L-Direct` must not be labeled as LPAN-L. The registered main LPAN-L option is the progressive model; historical external evidence and new in-repository runs must retain separate provenance.
 
 CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode positions `0..5`. They perform sequence-to-sequence reconstruction of the complete six-block frame, including the two pilot positions; they are not strict future-only predictors beginning at position 2.
 
