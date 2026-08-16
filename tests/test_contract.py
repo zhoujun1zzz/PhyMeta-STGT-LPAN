@@ -26,6 +26,7 @@ from lpan.engine import (
 )
 from lpan.metrics import MetricAccumulator
 from lpan.models import (
+    LPANLResidualBlock,
     build_model,
     expand_observations_to_grid,
     grid_aware_spatial_interpolation_weights,
@@ -258,7 +259,36 @@ def test_lpan_l_direct_is_single_stage_32_to_256() -> None:
     prediction = model(batch)
     assert prediction.shape == (1, 6, 256, 64, 2)
     assert model.target_nodes == 256
+    assert len(model.body) == 3
+    assert [block.grouped for block in model.body] == [True, False, False]
     assert not any(isinstance(module, torch.nn.Upsample) for module in model.modules())
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_lpan_l_residual_block_matches_official_activation_formula(
+    grouped: bool,
+) -> None:
+    class Multiply(torch.nn.Module):
+        def __init__(self, factor: float) -> None:
+            super().__init__()
+            self.factor = factor
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return value * self.factor
+
+    block = LPANLResidualBlock(1, grouped=grouped)
+    block.conv1 = torch.nn.Identity()
+    block.conv2 = torch.nn.Identity()
+    block.project = Multiply(2.0) if grouped else torch.nn.Identity()
+    block.attention = Multiply(3.0)
+    inputs = torch.tensor([[[[-2.0, 1.0]]]])
+    first = block.activation(block.conv1(inputs))
+    second = block.conv2(first)
+    if grouped:
+        second = block.activation(second)
+        second = block.project(second)
+    expected = inputs + block.attention(second)
+    assert_exact_tensor(block(inputs), expected)
 
 
 def test_lpan_l_direct_rejects_nonofficial_geometry_and_ambiguous_alias() -> None:

@@ -218,6 +218,7 @@ class LPANLResidualBlock(nn.Module):
 
     def __init__(self, channels: int, *, grouped: bool = False) -> None:
         super().__init__()
+        self.grouped = grouped
         first_groups = 16 if grouped and channels % 16 == 0 else 1
         second_groups = 4 if grouped and channels % 4 == 0 else 1
         self.conv1 = weight_norm(
@@ -245,7 +246,9 @@ class LPANLResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.activation(self.conv1(x))
-        residual = self.activation(self.conv2(residual))
+        residual = self.conv2(residual)
+        if self.grouped:
+            residual = self.activation(residual)
         residual = self.project(residual)
         return x + self.attention(residual)
 
@@ -263,7 +266,7 @@ class LPANLDirect(nn.Module):
         obs_blocks: int,
         query_blocks: int,
         channels: int = 96,
-        body_blocks: int = 4,
+        body_blocks: int = 3,
     ) -> None:
         super().__init__()
         self.obs_blocks = obs_blocks
