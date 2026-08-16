@@ -135,6 +135,10 @@ def expand_observations_to_grid(
         raise ValueError(
             "observation_mask must match [batch, observed_time, observed_RIS]."
         )
+    # Official LPAN batches carry an explicit all-true mask. Reuse the shared
+    # interpolation matrix instead of rebuilding it for every sample/time.
+    if bool(mask.all()):
+        return torch.einsum("np,btpmc->btnmc", weights, obs)
     batches: list[torch.Tensor] = []
     for batch_index in range(obs.shape[0]):
         times: list[torch.Tensor] = []
