@@ -17,23 +17,22 @@ Mobility is frozen at training batch 32 and evaluation batch 64, based on the se
 
 The benchmark does not read validation or test data and does not produce a paper metric.
 
-## Stage B: two-round search
+## Stage B: targeted boundary search
 
-For each domain, the deterministic candidate generator keeps random search seed 2026, shared training seed 123, and the existing 12-candidate search space.
+Each domain runs independently with shared training seed 123 and validation-only selection.
 
 ```text
-Round 1: 12 candidates x 25 epochs
-             |
-             +-- rank by best validation linear NMSE
-             |
-Round 2: top 3 resume from epoch-25 last_checkpoint.pth
-             |
-             +-- train to at most epoch 100
+Capacity: hidden 96/128/160 x 20 epochs at LR 5e-4
+          -> rank epochs 16-20 median linear NMSE
+Learning rate: 5e-4/8e-4/1e-3 x 40 epochs from scratch
+          -> rank epochs 31-40 median linear NMSE
+Final: winner resumes from epoch-40 last_checkpoint.pth
+          -> train to at most epoch 100
 ```
 
-Promotion uses the same run directory and restores model, optimizer, Python, NumPy, PyTorch CPU/CUDA, and DataLoader generator states. `search_plan.json` records the protocol; `trials.json` and `trials.csv` record both rankings and promotion status; `best_result.json` is the only Stage-B artifact consumed by later stages.
+Final continuation restores model, optimizer, Python, NumPy, PyTorch CPU/CUDA, DataLoader generator states, and history. Phase A and B use fixed budgets without early truncation. `best_result.json` remains compatible with later stages and records boundary hits without automatically extending the search.
 
-The nominal budget is `12 x 25 + 3 x 75 = 525` epochs per domain, 43.75% of the previous `12 x 100` budget.
+The nominal budget is `3 x 20 + 3 x 40 + 60 = 240` epochs per domain. The historical two-round protocol remains available through the CLI for reproduction.
 
 ## Unified early stopping
 
@@ -53,7 +52,7 @@ Patience begins after epoch 40, so the earliest stopping point is epoch 55. The 
 ```text
 Batch benchmark
   -> Stage A: complexity + interpolation/ridge validation
-  -> Stage B: two-round Quasi and Mobility search
+  -> Stage B: targeted-boundary Quasi and Mobility search
   -> Stage C: best PhyMeta-STGT at seeds 123/456/789
   -> Stage D: all domain-applicable trainable baselines at 123/456/789
   -> Stage E: all Mobility ablations at 123; structural ablations at 456/789
@@ -61,7 +60,7 @@ Batch benchmark
   -> Stage F: independent test, per-SNR, Ridge test, mean/std, complexity links
 ```
 
-Quasi baselines are LPAN-L-Direct, EDSR-lite, and Spatial GCN. Mobility additionally includes CNN-GRU and GCN-GRU. Stage E covers spatial cross-attention, graph, temporal attention, domain adapter, coordinate encoding, and the registered loss ablations. Structural variants are repeated for seeds 456 and 789.
+Quasi baselines are progressive LPAN, progressive LPAN-L, EDSR-lite, and Spatial GCN. Mobility additionally includes CNN-GRU and GCN-GRU; its LPAN is explicitly channel-adapted while LPAN-L follows the public Mobility structure. `--exclude-mobility-adapted-lpan` can omit only the adapted LPAN. LPAN-L-Direct is supplementary and is not in Stage D by default.
 
 ## Operation and recovery
 

@@ -14,7 +14,7 @@ import torch
 from torch import nn
 
 from .metrics import MetricAccumulator
-from .objectives import LossWeights, combined_loss
+from .objectives import LossWeights, combined_loss, progressive_charbonnier_loss
 
 
 def move_batch(
@@ -49,6 +49,7 @@ def train_epoch(
     weights: LossWeights,
     *,
     grad_clip: float = 1.0,
+    loss_profile: str = "combined",
 ) -> dict[str, float]:
     model.train()
     totals: dict[str, float] = {}
@@ -56,8 +57,18 @@ def train_epoch(
     for cpu_batch in loader:
         batch = move_batch(cpu_batch, device)
         optimizer.zero_grad(set_to_none=True)
-        prediction = model(batch)
-        loss, parts = combined_loss(prediction, batch, weights)
+        if loss_profile == "official_progressive_charbonnier":
+            if not hasattr(model, "forward_multiscale"):
+                raise ValueError(
+                    "official_progressive_charbonnier requires forward_multiscale()."
+                )
+            predictions = model.forward_multiscale(batch)
+            loss, parts = progressive_charbonnier_loss(predictions, batch)
+        elif loss_profile == "combined":
+            prediction = model(batch)
+            loss, parts = combined_loss(prediction, batch, weights)
+        else:
+            raise ValueError(f"Unknown loss profile {loss_profile!r}.")
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite training loss: {parts}")
         loss.backward()

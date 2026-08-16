@@ -201,7 +201,7 @@ class ResidualBlock(nn.Module):
 
 
 class LPANLChannelAttention(nn.Module):
-    """Channel attention used by the LPAN-L-derived direct baseline."""
+    """Tanh channel attention used by the LPAN-family baselines."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -324,6 +324,285 @@ class LPANLDirect(nn.Module):
             b, 2, self.query_blocks, m, self.target_nodes
         )
         return output.permute(0, 2, 4, 3, 1).contiguous()
+
+
+def _validate_progressive_lpan_input(
+    batch: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Validate and return the unified LPAN observation tensor."""
+    obs = batch["obs_h"]
+    if obs.ndim != 5 or obs.shape[-1] != 2:
+        raise ValueError("obs_h must have shape [B,T,32,64,2].")
+    if obs.shape[2:4] != (32, 64):
+        raise ValueError(
+            "Progressive LPAN expects 32 observed RIS columns and 64 antennas."
+        )
+    index = batch["obs_ris_index"].to(obs.device)
+    expected = torch.arange(0, 256, 8, device=obs.device)
+    if index.ndim == 1:
+        compatible = index.shape == expected.shape and torch.equal(index, expected)
+    else:
+        compatible = (
+            index.shape[-1] == expected.numel()
+            and bool((index == expected.view(1, -1)).all())
+        )
+    if not compatible:
+        raise ValueError(
+            "Progressive LPAN supports only obs_ris_index=(0,8,...,248)."
+        )
+    return obs
+
+
+def lpan_grouped_input(obs: torch.Tensor) -> torch.Tensor:
+    """Convert [B,T,N,M,2] to official grouped [B,2T,M,N] order."""
+    if obs.ndim != 5 or obs.shape[-1] != 2:
+        raise ValueError("obs must have shape [B,T,N,M,2].")
+    b, t, n, m, _ = obs.shape
+    return obs.permute(0, 4, 1, 3, 2).reshape(b, 2 * t, m, n).contiguous()
+
+
+def lpan_grouped_output(
+    image: torch.Tensor, query_blocks: int
+) -> torch.Tensor:
+    """Convert official grouped [B,2Q,M,N] to [B,Q,N,M,2]."""
+    if image.ndim != 4 or image.shape[1] != 2 * query_blocks:
+        raise ValueError(
+            f"image must have shape [B,{2 * query_blocks},M,N]."
+        )
+    b, _, m, n = image.shape
+    return (
+        image.reshape(b, 2, query_blocks, m, n)
+        .permute(0, 2, 4, 3, 1)
+        .contiguous()
+    )
+
+
+class LPANResidualBlock(nn.Module):
+    """Ordinary residual block from the public LPAN implementation."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = weight_norm(nn.Conv2d(channels, channels, 3, padding=1))
+        self.conv2 = weight_norm(nn.Conv2d(channels, channels, 3, padding=1))
+        self.activation1 = nn.LeakyReLU(negative_slope=0.2)
+        self.activation2 = nn.LeakyReLU(negative_slope=0.2)
+        self.attention = LPANLChannelAttention(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.activation1(self.conv1(x))
+        residual = self.activation2(self.conv2(residual))
+        return x + self.attention(residual)
+
+
+class LPANFeatureStage(nn.Module):
+    """Four ordinary LPAN blocks followed by 2x feature refinement."""
+
+    def __init__(self, channels: int = 96) -> None:
+        super().__init__()
+        self.blocks = nn.ModuleList(LPANResidualBlock(channels) for _ in range(4))
+        self.refine = nn.Sequential(
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
+
+
+class LPANLFeatureStage(nn.Module):
+    """Public LPAN-L first/second stage: one grouped plus two ordinary blocks."""
+
+    def __init__(self, channels: int = 96) -> None:
+        super().__init__()
+        self.grouped_block = LPANLResidualBlock(channels, grouped=True)
+        self.ordinary_blocks = nn.ModuleList(
+            LPANLResidualBlock(channels) for _ in range(2)
+        )
+        self.refine = nn.Sequential(
+            weight_norm(nn.Conv2d(channels, channels, 3, padding=1)),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Public code overwrites repeated evaluations of the same block on x.
+        x = self.grouped_block(x)
+        for block in self.ordinary_blocks:
+            x = block(x)
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
+
+
+class LPANLFinalFeatureStage(nn.Module):
+    """Public LPAN-L third stage with the same-input loop elided."""
+
+    def __init__(self, channels: int = 96) -> None:
+        super().__init__()
+        self.grouped_block = LPANLResidualBlock(channels, grouped=True)
+        self.ordinary_blocks = nn.ModuleList()
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.LeakyReLU(negative_slope=0.2),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.grouped_block(x)
+        return self.refine(
+            F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        )
+
+
+class ProgressiveReconstruction(nn.Module):
+    """Public LPAN feature and nearest-neighbour skip reconstruction."""
+
+    def __init__(self, feature_channels: int, input_channels: int, output_channels: int):
+        super().__init__()
+        self.feature = weight_norm(
+            nn.Conv2d(feature_channels, output_channels, 3, padding=1)
+        )
+        self.skip = nn.Conv2d(input_channels, output_channels, 3, padding=1)
+
+    def forward(self, features: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+        previous = F.interpolate(
+            previous, scale_factor=(1, 2), mode="nearest"
+        )
+        return self.feature(features) + self.skip(previous)
+
+
+class ProgressiveLPAN(nn.Module):
+    """True 32->64->128->256 LPAN or LPAN-L reconstruction baseline."""
+
+    def __init__(
+        self,
+        obs_blocks: int,
+        query_blocks: int,
+        *,
+        lightweight: bool,
+        domain: str,
+        channels: int = 96,
+    ) -> None:
+        super().__init__()
+        self.obs_blocks = obs_blocks
+        self.query_blocks = query_blocks
+        self.domain = domain
+        self.lightweight = lightweight
+        input_channels = 2 * obs_blocks
+        output_channels = 2 * query_blocks
+        self.head = weight_norm(
+            nn.Conv2d(input_channels, channels, 3, padding=1)
+        )
+        if lightweight:
+            self.feature_stages = nn.ModuleList(
+                [
+                    LPANLFeatureStage(channels),
+                    LPANLFeatureStage(channels),
+                    LPANLFinalFeatureStage(channels),
+                ]
+            )
+        else:
+            self.feature_stages = nn.ModuleList(
+                LPANFeatureStage(channels) for _ in range(3)
+            )
+        first_reconstruction = ProgressiveReconstruction(
+            channels, input_channels, output_channels
+        )
+        if lightweight and input_channels == output_channels:
+            # Public Quasi LPAN-L reuses ImageReconstruction1 for HR2 and HR4.
+            final_reconstruction = ProgressiveReconstruction(
+                channels, output_channels, output_channels
+            )
+            reconstruction_stages = [
+                first_reconstruction,
+                first_reconstruction,
+                final_reconstruction,
+            ]
+        elif lightweight:
+            # Public Mobility LPAN-L reuses ImageReconstruction2 for HR4 and HR8.
+            later_reconstruction = ProgressiveReconstruction(
+                channels, output_channels, output_channels
+            )
+            reconstruction_stages = [
+                first_reconstruction,
+                later_reconstruction,
+                later_reconstruction,
+            ]
+        else:
+            reconstruction_stages = [
+                first_reconstruction,
+                ProgressiveReconstruction(
+                    channels, output_channels, output_channels
+                ),
+                ProgressiveReconstruction(
+                    channels, output_channels, output_channels
+                ),
+            ]
+        self.reconstruction_stages = nn.ModuleList(reconstruction_stages)
+
+    def forward_multiscale(
+        self, batch: Mapping[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        obs = _validate_progressive_lpan_input(batch)
+        if obs.shape[1] != self.obs_blocks:
+            raise ValueError(
+                f"Expected {self.obs_blocks} observation blocks, got {obs.shape[1]}."
+            )
+        previous = lpan_grouped_input(obs)
+        features = self.head(previous)
+        outputs: list[torch.Tensor] = []
+        for feature_stage, reconstruction_stage in zip(
+            self.feature_stages, self.reconstruction_stages
+        ):
+            features = feature_stage(features)
+            previous = reconstruction_stage(features, previous)
+            outputs.append(lpan_grouped_output(previous, self.query_blocks))
+        return outputs[0], outputs[1], outputs[2]
+
+    def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        return self.forward_multiscale(batch)[-1]
+
+    def protocol_metadata(self) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            "progressive_reconstruction": True,
+            "progressive_scales": [64, 128, 256],
+            "source_repository": "WiCi-Lab/LPAN",
+            "domain": self.domain,
+            "feature_channels": 96,
+        }
+        if self.lightweight:
+            metadata.update(
+                {
+                    "public_code_semantics_preserved": True,
+                    "redundant_same_input_loop_elided": True,
+                    "public_reconstruction_weight_sharing_preserved": True,
+                    "official_mobility_model": self.domain == "mobility",
+                    "source_fidelity": (
+                        "public Mobility_LPAN_L1.py"
+                        if self.domain == "mobility"
+                        else "public LPAN_L.py"
+                    ),
+                }
+            )
+        elif self.domain == "mobility":
+            metadata.update(
+                {
+                    "source_fidelity": (
+                        "LPAN architecture with mobility channel adaptation"
+                    ),
+                    "official_mobility_model": False,
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "official_mobility_model": False,
+                    "source_fidelity": "public LPAN.py",
+                }
+            )
+        return metadata
 
 
 class EDSRLite(nn.Module):
@@ -716,6 +995,10 @@ def build_model(
         return EDSRLite(*blocks, hidden=max(32, hidden), layers=graph_layers + 2)
     if name in {"lpan_l_direct", "lpanl_direct"}:
         return LPANLDirect(*blocks)
+    if name in {"lpan_progressive", "lpan"}:
+        return ProgressiveLPAN(*blocks, lightweight=False, domain=domain)
+    if name == "lpan_l_progressive":
+        return ProgressiveLPAN(*blocks, lightweight=True, domain=domain)
     if name in {"spatial_gcn", "gcn"}:
         return SpatialGCN(hidden, graph_layers)
     if name in {"cnn_gru", "cnngru"}:
@@ -725,6 +1008,7 @@ def build_model(
     if name in {"phymeta_stgt", "stgt", "ours"}:
         return PhyMetaSTGT(hidden, heads, graph_layers, dropout, ablation)
     raise ValueError(
-        f"Unknown model {name!r}; choose lpan_l_direct, edsr_lite, "
-        "spatial_gcn, cnn_gru, gcn_gru, or phymeta_stgt."
+        f"Unknown model {name!r}; choose lpan_progressive, "
+        "lpan_l_progressive, lpan_l_direct, edsr_lite, spatial_gcn, "
+        "cnn_gru, gcn_gru, or phymeta_stgt."
     )
