@@ -98,3 +98,38 @@ def combined_loss(
     values = {key: float(value.detach()) for key, value in parts.items()}
     values["total"] = float(total.detach())
     return total, values
+
+
+def progressive_targets(
+    target_h: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct public LPAN 2x/4x/8x targets with exact RIS indices."""
+    if target_h.ndim != 5 or target_h.shape[2] != 256:
+        raise ValueError("target_h must have shape [B,Q,256,M,2].")
+    return target_h[:, :, 1::4], target_h[:, :, 1::2], target_h
+
+
+def progressive_charbonnier_loss(
+    predictions: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    constant: float = 1e-5,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Equal-weight FP32 Charbonnier loss from the public LPAN code."""
+    targets = progressive_targets(batch["target_h"])
+    if len(predictions) != 3:
+        raise ValueError("Progressive LPAN must return exactly three scales.")
+    losses = []
+    for prediction, target in zip(predictions, targets):
+        if prediction.shape != target.shape:
+            raise ValueError(
+                f"Progressive prediction {prediction.shape} != target {target.shape}."
+            )
+        losses.append(torch.sqrt((prediction - target).square() + constant).mean())
+    total = sum(losses)
+    values = {
+        "hr2_charbonnier": float(losses[0].detach()),
+        "hr4_charbonnier": float(losses[1].detach()),
+        "hr8_charbonnier": float(losses[2].detach()),
+        "total": float(total.detach()),
+    }
+    return total, values

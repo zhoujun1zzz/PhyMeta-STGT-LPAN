@@ -6,6 +6,7 @@ import gc
 import json
 import random
 import shlex
+import shutil
 import sys
 import time
 import traceback
@@ -63,6 +64,8 @@ MOBILITY_EXPECTED_SAMPLES = {
     "test": 9000,
 }
 MODEL_DISPLAY_NAMES = {
+    "lpan_progressive": "LPAN",
+    "lpan_l_progressive": "LPAN-L",
     "lpan_l_direct": "LPAN-L-Direct",
     "edsr_lite": "EDSR-lite",
     "spatial_gcn": "Spatial GCN",
@@ -70,6 +73,7 @@ MODEL_DISPLAY_NAMES = {
     "gcn_gru": "GCN-GRU",
     "phymeta_stgt": "PhyMeta-STGT",
 }
+PROGRESSIVE_LPAN_MODELS = {"lpan_progressive", "lpan_l_progressive"}
 
 
 def infer_semantic_profile(
@@ -197,6 +201,65 @@ def model_parameter_report(model: torch.nn.Module) -> dict[str, float | int]:
         "trainable_parameters": trainable,
         "trainable_fraction": trainable / max(1, total),
     }
+
+
+def resolve_training_profile(args: argparse.Namespace) -> dict[str, object]:
+    """Resolve model-specific optimization without changing unified evaluation."""
+    requested = getattr(args, "training_profile", "auto")
+    if requested == "auto":
+        name = (
+            "lpan_public_code"
+            if args.model in PROGRESSIVE_LPAN_MODELS
+            else "unified"
+        )
+    else:
+        name = requested
+    if name == "lpan_public_code" and args.model not in PROGRESSIVE_LPAN_MODELS:
+        raise ValueError(
+            "lpan_public_code training is only valid for progressive LPAN models."
+        )
+    if name == "lpan_public_code":
+        return {
+            "name": name,
+            "loss_profile": "official_progressive_charbonnier",
+            "optimizer": "AdamW",
+            "betas": [0.9, 0.999],
+            "initial_learning_rate": float(args.lpan_initial_learning_rate),
+            "final_learning_rate": float(args.lpan_final_learning_rate),
+            "weight_decay": float(args.lpan_weight_decay),
+            "schedule": "cosine_epoch_deterministic",
+            "schedule_max_epochs": int(args.epochs),
+            "precision": "FP32",
+            "source": "public-code-derived training profile",
+            "charbonnier_constant": 1e-5,
+            "scale_weights": [1.0, 1.0, 1.0],
+            "official_public_code_used_fixed_100_epochs": True,
+            "unified_framework_uses_validation_early_stopping": bool(
+                args.early_stopping and args.mode == "full"
+            ),
+        }
+    return {
+        "name": "unified",
+        "loss_profile": "combined",
+        "optimizer": "AdamW",
+        "betas": [0.9, 0.999],
+        "initial_learning_rate": float(args.learning_rate),
+        "final_learning_rate": None,
+        "weight_decay": float(args.weight_decay),
+        "schedule": "constant",
+        "schedule_max_epochs": None,
+        "precision": "FP32",
+    }
+
+
+def training_learning_rate(profile: dict[str, object], epoch: int) -> float:
+    initial = float(profile["initial_learning_rate"])
+    if profile["schedule"] == "constant":
+        return initial
+    final = float(profile["final_learning_rate"])
+    maximum = int(profile["schedule_max_epochs"])
+    progress = min(max(epoch - 1, 0), maximum) / maximum
+    return final + 0.5 * (initial - final) * (1.0 + np.cos(np.pi * progress))
 
 
 def audit_command(args: argparse.Namespace) -> None:
@@ -602,7 +665,11 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     smoke = args.mode == "smoke"
     max_train = args.max_train or (64 if smoke else None)
     max_val = args.max_val or (16 if smoke else None)
-    epochs = 1 if smoke else args.epochs
+    epochs = (
+        int(getattr(args, "smoke_epochs_override", 1))
+        if smoke
+        else args.epochs
+    )
     stopping = early_stopping_config(args, smoke=smoke)
     train_loader = make_loader(
         domain,
@@ -636,6 +703,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     )
     config = model_config(args, domain)
     model = build_model(args.model, **config)
+    training_profile = resolve_training_profile(args)
     device = device_from(args.device)
     model.to(device)
 
@@ -651,8 +719,9 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     adaptation = configure_adaptation(model, args.adaptation)
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
+        lr=float(training_profile["initial_learning_rate"]),
+        betas=tuple(training_profile["betas"]),
+        weight_decay=float(training_profile["weight_decay"]),
     )
     stamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = args.run_name or f"{domain}_{args.model}_{args.mode}_{stamp}"
@@ -708,8 +777,9 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "batch_size": args.batch_size,
         "eval_batch_size": args.eval_batch_size,
         "workers": args.workers,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
+        "learning_rate": training_profile["initial_learning_rate"],
+        "weight_decay": training_profile["weight_decay"],
+        "training_profile": training_profile,
         "grad_clip": args.grad_clip,
         "early_stopping": stopping,
         "loss_weights": {
@@ -719,6 +789,8 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             "delta": weights.delta,
         },
     }
+    if hasattr(model, "protocol_metadata"):
+        metadata["model_protocol"] = model.protocol_metadata()
     start_epoch, best_nmse = 1, float("inf")
     stale_epochs = 0
     history: list[dict[str, object]] = []
@@ -802,6 +874,10 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             "weight_decay": (
                 saved_metadata.get("weight_decay"),
                 metadata["weight_decay"],
+            ),
+            "training_profile": (
+                saved_metadata.get("training_profile"),
+                metadata["training_profile"],
             ),
             "grad_clip": (
                 saved_metadata.get("grad_clip"),
@@ -896,6 +972,9 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     stop_reason = None
     for epoch in range(start_epoch, epochs + 1):
         started = time.perf_counter()
+        current_learning_rate = training_learning_rate(training_profile, epoch)
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = current_learning_rate
         train_result = train_epoch(
             model,
             train_loader,
@@ -903,6 +982,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             device,
             weights,
             grad_clip=args.grad_clip,
+            loss_profile=str(training_profile["loss_profile"]),
         )
         val_result = evaluate_model(model, val_loader, device)
         val_nmse = float(val_result["nmse_linear"]["overall"])
@@ -918,13 +998,17 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         row = {
             "epoch": epoch,
             "train_total": train_result["total"],
-            "train_nmse": train_result["nmse"],
+            "train_nmse": train_result.get("nmse"),
+            "learning_rate": current_learning_rate,
             "validation_nmse_linear": val_nmse,
             "validation_nmse_db": nmse_db_from_result(val_result),
             "improved": improved,
             "early_stopping_stale_epochs": stale_epochs,
             "epoch_seconds": time.perf_counter() - started,
         }
+        for key, value in train_result.items():
+            if key not in {"total", "nmse"}:
+                row[f"train_{key}"] = value
         history.append(row)
         write_history(results / "training_history.csv", history)
         rng_state = capture_rng_state(
@@ -1032,7 +1116,7 @@ def _study_trial_args(
     return argparse.Namespace(**values)
 
 
-def tune_command(args: argparse.Namespace) -> dict[str, object]:
+def two_round_tune_command(args: argparse.Namespace) -> dict[str, object]:
     """Run validation-only successive-halving style hyperparameter search."""
 
     candidates = hyperparameter_candidates(
@@ -1272,6 +1356,335 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
     write_json(study_dir / "best_result.json", summary)
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return summary
+
+
+def late_window_nmse_metrics(
+    history: list[dict[str, object]], start_epoch: int, end_epoch: int
+) -> dict[str, float | int | list[int]]:
+    """Summarize an inclusive epoch window in linear NMSE space."""
+    selected = [
+        row
+        for row in history
+        if start_epoch <= int(row["epoch"]) <= end_epoch
+    ]
+    expected = end_epoch - start_epoch + 1
+    if len(selected) != expected:
+        raise ValueError(
+            f"Expected {expected} validation rows for epochs "
+            f"{start_epoch}..{end_epoch}, found {len(selected)}."
+        )
+    values = np.asarray(
+        [float(row["validation_nmse_linear"]) for row in selected],
+        dtype=np.float64,
+    )
+    if not np.isfinite(values).all():
+        raise FloatingPointError("Late-window validation NMSE contains NaN/Inf.")
+    return {
+        "window_epochs": [start_epoch, end_epoch],
+        "sample_count": int(values.size),
+        "median_validation_nmse_linear": float(np.median(values)),
+        "mean_validation_nmse_linear": float(np.mean(values)),
+        "std_validation_nmse_linear": float(np.std(values, ddof=0)),
+        "best_validation_nmse_linear": float(np.min(values)),
+    }
+
+
+def targeted_boundary_search_plan(args: argparse.Namespace) -> dict[str, object]:
+    """Return the deterministic, validation-only targeted search plan."""
+    smoke = args.mode == "smoke"
+    capacity_epochs = 1 if smoke else 20
+    learning_rate_epochs = 1 if smoke else 40
+    final_epochs = 2 if smoke else 100
+    return {
+        "domain": args.domain,
+        "model": "phymeta_stgt",
+        "tuning_protocol": "targeted_boundary",
+        "test_split_used": False,
+        "training_seed_shared_by_all_trials": args.seed,
+        "selection_space": "linear NMSE",
+        "capacity": {
+            "candidates": [96, 128, 160],
+            "fixed": {
+                "graph_layers": 2,
+                "heads": 4,
+                "dropout": 0.0,
+                "learning_rate": 5e-4,
+                "weight_decay": 0.0,
+            },
+            "budget_epochs": capacity_epochs,
+            "late_window_epochs": (
+                [1, 1] if smoke else [16, 20]
+            ),
+            "early_stopping_can_trigger": False,
+            "primary_metric": "late_window_median_validation_nmse_linear",
+            "secondary_metric": "best_validation_nmse_linear_up_to_budget",
+        },
+        "learning_rate": {
+            "candidates": [5e-4, 8e-4, 1e-3],
+            "fixed": {
+                "graph_layers": 2,
+                "heads": 4,
+                "dropout": 0.0,
+                "weight_decay": 0.0,
+            },
+            "from_scratch": True,
+            "resume_from_capacity": False,
+            "budget_epochs": learning_rate_epochs,
+            "late_window_epochs": (
+                [1, 1] if smoke else [31, 40]
+            ),
+            "early_stopping_can_trigger": False,
+            "primary_metric": "late_window_median_validation_nmse_linear",
+            "secondary_metric": "best_validation_nmse_linear_up_to_budget",
+        },
+        "final": {
+            "max_epochs": final_epochs,
+            "resume_checkpoint": "winning learning-rate trial last_checkpoint.pth",
+            "resume_preserves_optimizer_rng_loader_and_history": True,
+            "early_stopping": {
+                "enabled": not smoke,
+                "min_epochs": 40,
+                "patience": 15,
+            },
+        },
+    }
+
+
+def targeted_boundary_tune_command(args: argparse.Namespace) -> dict[str, object]:
+    """Run sequential capacity, learning-rate, and exact-resume tuning."""
+    plan = targeted_boundary_search_plan(args)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    study_name = args.study_name or f"targeted_{args.domain}_{stamp}"
+    study_dir = Path(args.output_root) / study_name
+    if study_dir.exists():
+        raise FileExistsError(
+            f"Study directory already exists; choose another --study-name: {study_dir}"
+        )
+    capacity_dir = study_dir / "capacity"
+    learning_rate_dir = study_dir / "learning_rate"
+    capacity_dir.mkdir(parents=True)
+    learning_rate_dir.mkdir(parents=True)
+    write_json(study_dir / "search_plan.json", plan)
+    study_started = time.perf_counter()
+
+    capacity_plan = plan["capacity"]
+    assert isinstance(capacity_plan, dict)
+    capacity_fixed = capacity_plan["fixed"]
+    assert isinstance(capacity_fixed, dict)
+    capacity_budget = int(capacity_plan["budget_epochs"])
+    capacity_window = capacity_plan["late_window_epochs"]
+    assert isinstance(capacity_window, list)
+    capacity_rows: list[dict[str, object]] = []
+    for hidden in capacity_plan["candidates"]:
+        run_name = f"trial_hidden_{int(hidden):03d}"
+        trial_started = time.perf_counter()
+        seed_everything(args.seed)
+        trial_args = _study_trial_args(
+            args,
+            capacity_dir,
+            run_name,
+            epochs=capacity_budget,
+            smoke_epochs_override=capacity_budget,
+            early_stopping=True,
+            min_epochs=40,
+            patience=15,
+            hidden=int(hidden),
+            **capacity_fixed,
+        )
+        outcome = train_command(trial_args)
+        result = outcome["result"]
+        assert isinstance(result, dict)
+        history = result["history"]
+        assert isinstance(history, list)
+        window = late_window_nmse_metrics(
+            history, int(capacity_window[0]), int(capacity_window[1])
+        )
+        row = {
+            "hidden": int(hidden),
+            **capacity_fixed,
+            "status": "completed",
+            "from_scratch": True,
+            "resume": None,
+            "epochs_completed": result["epochs_completed"],
+            "best_validation_nmse_linear_up_to_budget": result[
+                "best_validation_nmse_linear"
+            ],
+            "late_window": window,
+            "late_window_median_validation_nmse_linear": window[
+                "median_validation_nmse_linear"
+            ],
+            "run_dir": outcome["run_dir"],
+            "wall_clock_seconds": time.perf_counter() - trial_started,
+        }
+        capacity_rows.append(row)
+        _write_study_rows(capacity_dir / "trials.csv", capacity_rows)
+        write_json(capacity_dir / "trials.json", capacity_rows)
+    capacity_ranking = sorted(
+        capacity_rows,
+        key=lambda row: (
+            float(row["late_window_median_validation_nmse_linear"]),
+            float(row["best_validation_nmse_linear_up_to_budget"]),
+        ),
+    )
+    selected_hidden = int(capacity_ranking[0]["hidden"])
+    write_json(capacity_dir / "capacity_ranking.json", capacity_ranking)
+
+    lr_plan = plan["learning_rate"]
+    assert isinstance(lr_plan, dict)
+    lr_fixed = lr_plan["fixed"]
+    assert isinstance(lr_fixed, dict)
+    lr_budget = int(lr_plan["budget_epochs"])
+    lr_window = lr_plan["late_window_epochs"]
+    assert isinstance(lr_window, list)
+    lr_rows: list[dict[str, object]] = []
+    for learning_rate in lr_plan["candidates"]:
+        label = f"{float(learning_rate):.0e}".replace("-0", "-")
+        run_name = f"trial_lr_{label}"
+        trial_started = time.perf_counter()
+        seed_everything(args.seed)
+        trial_args = _study_trial_args(
+            args,
+            learning_rate_dir,
+            run_name,
+            epochs=lr_budget,
+            smoke_epochs_override=lr_budget,
+            early_stopping=True,
+            min_epochs=40,
+            patience=15,
+            hidden=selected_hidden,
+            learning_rate=float(learning_rate),
+            **lr_fixed,
+        )
+        if trial_args.resume is not None:
+            raise AssertionError("Learning-rate trials must start from scratch.")
+        outcome = train_command(trial_args)
+        result = outcome["result"]
+        assert isinstance(result, dict)
+        history = result["history"]
+        assert isinstance(history, list)
+        window = late_window_nmse_metrics(
+            history, int(lr_window[0]), int(lr_window[1])
+        )
+        row = {
+            "hidden": selected_hidden,
+            "learning_rate": float(learning_rate),
+            **lr_fixed,
+            "status": "completed",
+            "from_scratch": True,
+            "resume": None,
+            "epochs_completed": result["epochs_completed"],
+            "best_validation_nmse_linear_up_to_budget": result[
+                "best_validation_nmse_linear"
+            ],
+            "late_window": window,
+            "late_window_median_validation_nmse_linear": window[
+                "median_validation_nmse_linear"
+            ],
+            "late_window_mean_validation_nmse_linear": window[
+                "mean_validation_nmse_linear"
+            ],
+            "late_window_std_validation_nmse_linear": window[
+                "std_validation_nmse_linear"
+            ],
+            "run_dir": outcome["run_dir"],
+            "wall_clock_seconds": time.perf_counter() - trial_started,
+        }
+        lr_rows.append(row)
+        _write_study_rows(learning_rate_dir / "trials.csv", lr_rows)
+        write_json(learning_rate_dir / "trials.json", lr_rows)
+    lr_ranking = sorted(
+        lr_rows,
+        key=lambda row: (
+            float(row["late_window_median_validation_nmse_linear"]),
+            float(row["best_validation_nmse_linear_up_to_budget"]),
+        ),
+    )
+    write_json(learning_rate_dir / "lr_ranking.json", lr_ranking)
+    winner = lr_ranking[0]
+
+    source_run = Path(str(winner["run_dir"]))
+    source_last = source_run / "checkpoints" / "last_checkpoint.pth"
+    if not source_last.is_file():
+        raise FileNotFoundError(f"Winning last checkpoint is missing: {source_last}")
+    final_dir = study_dir / "final"
+    shutil.copytree(source_run, final_dir)
+    final_last = final_dir / "checkpoints" / "last_checkpoint.pth"
+    final_plan = plan["final"]
+    assert isinstance(final_plan, dict)
+    final_max_epochs = int(final_plan["max_epochs"])
+    seed_everything(args.seed)
+    final_args = _study_trial_args(
+        args,
+        study_dir,
+        "final",
+        epochs=final_max_epochs,
+        smoke_epochs_override=final_max_epochs,
+        resume=str(final_last),
+        early_stopping=True,
+        min_epochs=40,
+        patience=15,
+        hidden=selected_hidden,
+        graph_layers=2,
+        heads=4,
+        dropout=0.0,
+        learning_rate=float(winner["learning_rate"]),
+        weight_decay=0.0,
+    )
+    final_outcome = train_command(final_args)
+    final_result = final_outcome["result"]
+    assert isinstance(final_result, dict)
+    boundary_hit = {
+        "hidden_upper": selected_hidden == 160,
+        "learning_rate_upper": float(winner["learning_rate"]) == 1e-3,
+    }
+    summary = {
+        "status": "smoke_search" if args.mode == "smoke" else "validation_search",
+        "domain": args.domain,
+        "study_dir": str(study_dir),
+        "tuning_protocol": "targeted_boundary",
+        "test_split_used": False,
+        "selection_metric": (
+            "late-window median validation sample-level linear NMSE; "
+            "best validation linear NMSE tie-break"
+        ),
+        "capacity_budget_epochs": capacity_budget,
+        "lr_budget_epochs": lr_budget,
+        "final_max_epochs": final_max_epochs,
+        "selected_hidden": selected_hidden,
+        "selected_learning_rate": float(winner["learning_rate"]),
+        "best_hyperparameters": {
+            "hidden": selected_hidden,
+            "graph_layers": 2,
+            "heads": 4,
+            "dropout": 0.0,
+            "learning_rate": float(winner["learning_rate"]),
+            "weight_decay": 0.0,
+        },
+        "best_checkpoint": str(
+            final_dir / "checkpoints" / "best_checkpoint.pth"
+        ),
+        "phase_c_resume_checkpoint": str(final_last),
+        "phase_c_resume_source_epoch": lr_budget,
+        "capacity_ranking": capacity_ranking,
+        "learning_rate_ranking": lr_ranking,
+        "final_result": final_result,
+        "boundary_hit": boundary_hit,
+        "boundary_recommendation": (
+            "Consider one additional boundary point in a separate study."
+            if any(boundary_hit.values())
+            else None
+        ),
+        "wall_clock_seconds": time.perf_counter() - study_started,
+    }
+    write_json(study_dir / "best_result.json", summary)
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    return summary
+
+
+def tune_command(args: argparse.Namespace) -> dict[str, object]:
+    if args.tuning_protocol == "targeted_boundary":
+        return targeted_boundary_tune_command(args)
+    return two_round_tune_command(args)
 
 
 ABLATION_HYPERPARAMETER_KEYS = (
@@ -2041,6 +2454,22 @@ def add_early_stopping(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--patience", type=int, default=15)
 
 
+def add_training_profile(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--training-profile",
+        choices=["auto", "unified", "lpan_public_code"],
+        default="auto",
+    )
+    parser.add_argument("--lpan-initial-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--lpan-final-learning-rate", type=float, default=5e-6)
+    parser.add_argument(
+        "--lpan-weight-decay",
+        type=float,
+        default=0.01,
+        help="Explicit AdamW value matching the current PyTorch default.",
+    )
+
+
 def add_data_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--data-root",
@@ -2111,6 +2540,7 @@ def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
     add_runtime(parser)
     add_model(parser)
     add_early_stopping(parser)
+    add_training_profile(parser)
     parser.set_defaults(
         model="phymeta_stgt",
         adaptation="full",
@@ -2140,6 +2570,8 @@ def parser() -> argparse.ArgumentParser:
         "--models",
         type=strings,
         default=(
+            "lpan_progressive",
+            "lpan_l_progressive",
             "lpan_l_direct",
             "edsr_lite",
             "spatial_gcn",
@@ -2189,6 +2621,8 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--model",
         choices=[
+            "lpan_progressive",
+            "lpan_l_progressive",
             "lpan_l_direct",
             "edsr_lite",
             "spatial_gcn",
@@ -2235,6 +2669,7 @@ def parser() -> argparse.ArgumentParser:
     add_runtime(train)
     add_model(train)
     add_early_stopping(train)
+    add_training_profile(train)
     train.set_defaults(func=train_command)
 
     evaluate = commands.add_parser("evaluate")
@@ -2323,6 +2758,12 @@ def parser() -> argparse.ArgumentParser:
 
     tune = commands.add_parser("tune")
     add_study_training_protocol(tune)
+    tune.add_argument(
+        "--tuning-protocol",
+        choices=["two_round_validation_promotion", "targeted_boundary"],
+        default="two_round_validation_promotion",
+        help="Preserve the historical protocol or run sequential boundary tuning.",
+    )
     tune.add_argument("--strategy", choices=["grid", "random"], default="random")
     tune.add_argument("--max-trials", type=int, default=12)
     tune.add_argument("--search-seed", type=int, default=2026)
