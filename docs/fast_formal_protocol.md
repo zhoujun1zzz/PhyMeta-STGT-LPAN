@@ -1,5 +1,10 @@
 # Fast formal experiment protocol
 
+> Historical protocol notice: this document describes the pre-repair pipeline.
+> Its Spatial GCN, CNN-GRU, GCN-GRU and 22-run Stage E are invalidated for the
+> final V1 comparison. Use `docs/v1_repair_protocol.md` and
+> `scripts/run_v1_repair_protocol.py` for the repaired, validation-only flow.
+
 This document freezes the accelerated paper experiment protocol after server validation of commit `627657b`. It does not change the two LPAN tasks, model inputs or targets, sample-level NMSE definition, principal comparison models, or test-isolation rule.
 
 ## Invariants

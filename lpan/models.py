@@ -654,13 +654,36 @@ class SpatialGCN(nn.Module):
         self.output = nn.Linear(hidden, 64 * 2)
         self.register_buffer("node_xy", grid_coordinates(), persistent=False)
 
+    def protocol_metadata(self) -> dict[str, object]:
+        return {
+            "spatial_initialization": "row_wise_physical_grid_interpolation",
+            "node_features": [
+                "interpolated_complex_channel",
+                "sparse_observation_mask",
+                "normalized_physical_coordinate",
+            ],
+            "graph_role": "residual_refinement",
+            "mobility_temporal_policy": "q0_observed0_q1plus_last_observation_hold",
+            "mobility_positioning": "spatial_only_control",
+        }
+
     def encode(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         obs = batch["obs_h"]
         b, t, p, _, _ = obs.shape
         index = _shared_vector(batch["obs_ris_index"]).to(obs.device)
-        full = obs.new_zeros(b, t, 256, 128)
-        observed_mask = batch["observation_mask"].to(obs).unsqueeze(-1)
-        full[:, :, index] = obs.reshape(b, t, p, 128) * observed_mask
+        full = expand_observations_to_grid(batch).reshape(b, t, 256, 128)
+        raw_mask = batch.get("observation_mask")
+        if raw_mask is None:
+            observed_mask = torch.ones(b, t, p, device=obs.device, dtype=obs.dtype)
+        else:
+            observed_mask = raw_mask.to(device=obs.device, dtype=obs.dtype)
+            if observed_mask.ndim == 2:
+                observed_mask = observed_mask.unsqueeze(0)
+            if tuple(observed_mask.shape) != (b, t, p):
+                raise ValueError(
+                    "observation_mask must match [batch, observed_time, observed_RIS]."
+                )
+        observed_mask = observed_mask.unsqueeze(-1)
         mask = obs.new_zeros(b, t, 256, 1)
         mask[:, :, index] = observed_mask
         xy = self.node_xy.to(obs).view(1, 1, 256, 2).expand(b, t, -1, -1)
@@ -689,8 +712,16 @@ class CNNGRU(nn.Module):
             ResidualBlock(hidden),
         )
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
-        self.time_decoder = AutoregressiveTimeDecoder(hidden)
+        self.time_decoder = AlignedTemporalDecoder(hidden)
         self.head = nn.Linear(hidden, 2)
+
+    def protocol_metadata(self) -> dict[str, object]:
+        return {
+            "temporal_alignment": "observed_states_direct_future_only_autoregression",
+            "observed_query_policy": "q0_h0_q1_h1",
+            "mobility_future_recurrent_steps": 4,
+            "hidden_width_policy": "registry_hidden_used_without_scaling",
+        }
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         full = expand_observations_to_grid(batch)
@@ -698,9 +729,10 @@ class CNNGRU(nn.Module):
         x = full.permute(0, 1, 4, 3, 2).reshape(b * t, 2, m, 256)
         x = self.encoder(x).reshape(b, t, self.hidden, m, 256)
         x = x.permute(0, 3, 4, 1, 2).reshape(b * m * 256, t, self.hidden)
-        _, hidden = self.gru(x)
+        observed_states, _ = self.gru(x)
+        obs_time = _shared_vector(batch["obs_time_index"]).to(x.device)
         query_time = _shared_vector(batch["query_time"]).to(x.device)
-        x = self.time_decoder(hidden[-1], query_time)
+        x = self.time_decoder(observed_states, obs_time, query_time)
         q = x.shape[1]
         x = self.head(x).reshape(b, m, 256, q, 2)
         return x.permute(0, 3, 2, 1, 4).contiguous()
@@ -710,22 +742,32 @@ class GCNGRU(SpatialGCN):
     def __init__(self, hidden: int = 64, layers: int = 3) -> None:
         super().__init__(hidden, layers)
         self.gru = nn.GRU(hidden, hidden, batch_first=True)
-        self.time_decoder = AutoregressiveTimeDecoder(hidden)
+        self.time_decoder = AlignedTemporalDecoder(hidden)
+
+    def protocol_metadata(self) -> dict[str, object]:
+        return {
+            **super().protocol_metadata(),
+            "mobility_positioning": "spatiotemporal_baseline",
+            "temporal_alignment": "observed_states_direct_future_only_autoregression",
+            "observed_query_policy": "q0_h0_q1_h1",
+            "mobility_future_recurrent_steps": 4,
+        }
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
         x = self.encode(batch)
         b, t, n, h = x.shape
         x = x.permute(0, 2, 1, 3).reshape(b * n, t, h)
-        _, hidden = self.gru(x)
+        observed_states, _ = self.gru(x)
+        obs_time = _shared_vector(batch["obs_time_index"]).to(x.device)
         query_time = _shared_vector(batch["query_time"]).to(x.device)
-        x = self.time_decoder(hidden[-1], query_time)
+        x = self.time_decoder(observed_states, obs_time, query_time)
         q = x.shape[1]
         x = self.output(x).reshape(b, n, q, 64, 2)
         return x.permute(0, 2, 1, 3, 4).contiguous()
 
 
-class AutoregressiveTimeDecoder(nn.Module):
-    """Generate distinct target-block states from an encoded observation history."""
+class AlignedTemporalDecoder(nn.Module):
+    """Align observed queries directly and autoregress only future queries."""
 
     def __init__(self, hidden: int) -> None:
         super().__init__()
@@ -736,21 +778,80 @@ class AutoregressiveTimeDecoder(nn.Module):
         )
         self.cell = nn.GRUCell(hidden, hidden)
 
-    def forward(
-        self, context: torch.Tensor, query_time: torch.Tensor
+    def decode_future_states(
+        self,
+        last_observed_state: torch.Tensor,
+        future_query_time: torch.Tensor,
+        *,
+        scale: int,
     ) -> torch.Tensor:
-        if query_time.numel() > 1 and not torch.all(query_time[1:] >= query_time[:-1]):
-            raise ValueError("query_time must be non-decreasing.")
-        scale = max(1, int(query_time.max().item()))
+        """Generate one recurrent state per chronologically ordered future query."""
+
+        if future_query_time.numel() == 0:
+            return last_observed_state.new_empty(
+                last_observed_state.shape[0], 0, last_observed_state.shape[1]
+            )
+        if future_query_time.numel() > 1 and not bool(
+            torch.all(future_query_time[1:] > future_query_time[:-1])
+        ):
+            raise ValueError("future query times must be strictly increasing.")
         time_features = self.time_encoder(
-            (query_time.to(context).reshape(-1, 1) / scale)
+            future_query_time.to(last_observed_state).reshape(-1, 1) / scale
         )
-        hidden = context
+        hidden = last_observed_state
         outputs = []
         for feature in time_features:
             hidden = self.cell(feature.expand_as(hidden), hidden)
             outputs.append(hidden)
         return torch.stack(outputs, dim=1)
+
+    def forward(
+        self,
+        observed_states: torch.Tensor,
+        obs_time: torch.Tensor,
+        query_time: torch.Tensor,
+    ) -> torch.Tensor:
+        if observed_states.ndim != 3:
+            raise ValueError("observed_states must have shape [items, observed_time, hidden].")
+        obs_time = obs_time.reshape(-1).to(observed_states.device)
+        query_time = query_time.reshape(-1).to(observed_states.device)
+        if observed_states.shape[1] != obs_time.numel():
+            raise ValueError("observed_states and obs_time lengths must match.")
+        if obs_time.numel() == 0 or query_time.numel() == 0:
+            raise ValueError("obs_time and query_time must be non-empty.")
+        if obs_time.numel() > 1 and not bool(torch.all(obs_time[1:] > obs_time[:-1])):
+            raise ValueError("obs_time must be strictly increasing.")
+
+        matches = query_time[:, None] == obs_time[None, :]
+        matched = matches.any(dim=1)
+        last_observed_time = obs_time[-1]
+        future = query_time > last_observed_time
+        if not bool(torch.all(matched | future)):
+            invalid = query_time[~(matched | future)].detach().cpu().tolist()
+            raise ValueError(
+                "Every query at or before the last observation must exactly match "
+                f"an observed time; unmatched queries: {invalid}."
+            )
+
+        items, _, hidden = observed_states.shape
+        output = observed_states.new_empty(items, query_time.numel(), hidden)
+        if bool(matched.any()):
+            observed_indices = matches[matched].to(torch.int64).argmax(dim=1)
+            output[:, matched] = observed_states.index_select(1, observed_indices)
+
+        if bool(future.any()):
+            future_positions = torch.where(future)[0]
+            chronological = torch.argsort(query_time.index_select(0, future_positions))
+            sorted_positions = future_positions.index_select(0, chronological)
+            sorted_times = query_time.index_select(0, sorted_positions)
+            if torch.unique(sorted_times).numel() != sorted_times.numel():
+                raise ValueError("future query times must be unique.")
+            scale = max(1, int(torch.max(query_time).item()))
+            future_states = self.decode_future_states(
+                observed_states[:, -1], sorted_times, scale=scale
+            )
+            output[:, sorted_positions] = future_states
+        return output
 
 
 class SparseGraphAttention(nn.Module):
@@ -1002,7 +1103,7 @@ def build_model(
     if name in {"spatial_gcn", "gcn"}:
         return SpatialGCN(hidden, graph_layers)
     if name in {"cnn_gru", "cnngru"}:
-        return CNNGRU(max(16, hidden // 2))
+        return CNNGRU(hidden)
     if name in {"gcn_gru", "gcngru"}:
         return GCNGRU(hidden, graph_layers)
     if name in {"phymeta_stgt", "stgt", "ours"}:

@@ -167,6 +167,14 @@ python main.py train --domain mobility --model phymeta_stgt --mode smoke
 
 Smoke mode uses 64 training samples, 16 validation samples, and one epoch. Its outputs are implementation checks, not reportable performance results.
 
+Spatial GCN now initializes every dense RIS node from the verified row-wise
+physical-grid interpolation, concatenates the sparse observation mask and
+normalized coordinates, and uses the GCN only as a residual graph refinement.
+On Mobility it is a spatial-only control: query 0 uses observed block 0 and all
+queries from 1 onward hold the spatial output of observed block 1. CNN-GRU and
+GCN-GRU directly decode the GRU states aligned with observed queries 0 and 1;
+their recurrent decoder is invoked only four times for future queries 2--5.
+
 ### Progressive LPAN and LPAN-L baselines
 
 The main LPAN baselines are `lpan_progressive` (displayed as LPAN) and
@@ -306,28 +314,55 @@ The checked-in same-condition tables and machine-readable outputs are in [`repor
 
 Do not place THOP MACs, paper-reported FLOPs, and profiler FLOPs in one column without reconciling their definitions. The official progressive LPAN-L and the task-adapted single-stage `lpan_l_direct` must be reported as separate architectures.
 
-### Controlled ablation study
+### Compact controlled ablation study
 
-The `ablate` command runs the full model and one-factor variants under the same seed, data fraction, optimizer settings, epoch budget, and Stage-B best hyperparameters. In full mode, `--best-result` is required and every variant automatically inherits `hidden`, graph layers, heads, dropout, learning rate, and weight decay from that validation-only search artifact. The spatial-attention ablation replaces that module with deterministic row-wise grid-aware interpolation; the temporal-attention ablation replaces it with deterministic linear temporal interpolation and nearest-value extension. Other variants remove graph refinement, the domain adapter, coordinate encoding, or individual auxiliary losses. Every result row stores both a stable variant ID and a publication-facing display name/replacement mechanism. Quasi-static studies automatically omit the inapplicable temporal-difference-loss ablation.
+The repaired V1 protocol runs eight strict one-factor Mobility ablations at seed
+123 only. The full-model `none` reference is reused from the frozen Stage-B/C
+seed-123 result and is not trained again. `nmse_only` is retained only for
+historical CLI reproduction and is excluded from the compact formal protocol
+because it removes several losses simultaneously. Every ablation inherits the
+same Stage-B hyperparameters and uses validation-only selection.
 
 ```bash
 python main.py ablate --domain mobility --mode full --epochs 100 \
   --best-result runs/mobility_hparam_seed123/best_result.json \
-  --study-name mobility_ablation_seed123
-
-python main.py ablate --domain mobility --mode full --epochs 100 \
-  --best-result runs/mobility_hparam_seed123/best_result.json \
-  --variants none,no_spatial_cross_attention,no_graph,no_temporal_attention,\
-no_domain_adapter,no_coordinate_encoding,nmse_only,no_charbonnier_loss,\
+  --reuse-full-reference \
+  --variants no_spatial_cross_attention,no_graph,no_temporal_attention,\
+no_domain_adapter,no_coordinate_encoding,no_charbonnier_loss,\
 no_observation_loss,no_temporal_delta_loss \
-  --study-name mobility_ablation_selected_seed123
+  --seed 123 --study-name mobility_compact_ablation_seed123
 ```
 
 Each result is selected independently on validation NMSE. `summary.json` records the inherited Stage-B artifact and hyperparameters and reports the dB change relative to the full model; final test evaluation should be run only after the ablation protocol and checkpoint-selection rule are frozen.
 
-### Automated fast formal pipeline
+### V1 repaired-baseline protocol
 
-The complete FP32 protocol is orchestrated by [`scripts/run_fast_formal_protocol.py`](scripts/run_fast_formal_protocol.py). It benchmarks the Quasi batch size, runs validation-only Stage A, executes targeted-boundary Stage B independently for both domains, runs three-seed PhyMeta and progressive-baseline studies, executes the Mobility ablations, freezes a checkpoint manifest, and only then opens the independent test split in Stage F.
+Use [`scripts/run_v1_repair_protocol.py`](scripts/run_v1_repair_protocol.py) to
+validate and reference the trusted artifacts under
+`runs/formal_d51be59_20260817_005210` without copying or modifying them. It
+reruns only fixed Quasi Spatial GCN and fixed Mobility CNN-GRU/GCN-GRU, gates
+seed 456/789 on a finite sub-0-dB seed-123 validation result, and runs the eight
+compact ablations. It has no Stage F and never opens the test split.
+
+```bash
+python scripts/run_v1_repair_protocol.py \
+  --reuse-formal-root /path/to/runs/formal_d51be59_20260817_005210 \
+  --output-root runs/v1_repair_<new_commit> \
+  --data-root /path/to/data --device cuda --phase smoke
+
+python scripts/run_v1_repair_protocol.py \
+  --reuse-formal-root /path/to/runs/formal_d51be59_20260817_005210 \
+  --output-root runs/v1_repair_<new_commit> \
+  --data-root /path/to/data --device cuda --phase seed123
+```
+
+Continue with `--phase remaining` only after seed 123 passes the gate, then use
+`--phase ablation`. The complete provenance and server commands are documented
+in [`docs/v1_repair_protocol.md`](docs/v1_repair_protocol.md).
+
+### Historical automated fast formal pipeline
+
+The pre-repair FP32 protocol is orchestrated by [`scripts/run_fast_formal_protocol.py`](scripts/run_fast_formal_protocol.py). It remains available for historical reproduction, but its old Spatial GCN/CNN-GRU/GCN-GRU and 22-run Stage E must not be used in the repaired final comparison.
 
 ```bash
 export OMP_NUM_THREADS=1
