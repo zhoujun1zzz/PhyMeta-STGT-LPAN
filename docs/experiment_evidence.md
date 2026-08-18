@@ -75,6 +75,32 @@ checkpoint-selection rule, seed policy and training budget. Hyperparameter
 selection uses validation only. The independent test split is evaluated only
 after the protocol and checkpoint have been frozen.
 
+## V1 repaired-baseline provenance boundary
+
+The formal run rooted at `runs/formal_d51be59_20260817_005210` remains immutable.
+Its Stage-A interpolation/Ridge validation artifacts, Stage-B tuning, Stage-C
+PhyMeta-STGT, and Stage-D LPAN, LPAN-L and EDSR-lite training are trusted and may
+be referenced read-only by a new manifest. They must not be copied over, moved,
+renamed or rewritten by the repair protocol.
+
+The old Spatial GCN results are labeled
+`legacy_invalid_for_final_comparison` because a shallow four-neighbor GCN was
+asked to propagate sample information from zero-filled unobserved nodes. The old
+CNN-GRU and GCN-GRU results have the same label because query 0/1 were generated
+by extra recurrent transitions from the final observed state instead of directly
+decoding h0/h1. GCN-GRU also inherited the old zero-filled spatial
+initialization. These artifacts remain historical evidence but cannot enter the
+final comparison or a new mean/std aggregation.
+
+Repaired results must be produced in a new run root. Quasi Spatial GCN uses an
+interpolated dense prior plus graph refinement. Mobility CNN-GRU and GCN-GRU use
+direct observed-state decoding and exactly four future recurrent steps. Mobility
+Spatial GCN, if reported, is explicitly a supplementary spatial-only control
+with last-observation hold. The compact ablation uses seed 123 and eight
+one-factor variants; its full-model reference is reused from Stage B/C and
+records `reference_retrained=false`. No repair or ablation selection may read
+the independent test split.
+
 ## Complexity reporting protocol
 
 Use `python main.py profile` for models registered in the unified repository.

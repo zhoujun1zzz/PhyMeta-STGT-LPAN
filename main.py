@@ -49,6 +49,7 @@ from lpan.ridge import EmpiricalRidge, RidgeStatistics
 from lpan.studies import (
     ABLATION_VARIANTS,
     ARCHITECTURE_ABLATIONS,
+    COMPACT_ABLATIONS,
     ablation_metadata,
     ablated_loss_weights,
     architectural_ablation,
@@ -1988,13 +1989,22 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "weight_decay": args.weight_decay,
         }
     )
-    variants = args.variants or ABLATION_VARIANTS
+    reuse_full_reference = bool(getattr(args, "reuse_full_reference", False))
+    if reuse_full_reference and args.best_result is None:
+        raise ValueError("--reuse-full-reference requires --best-result.")
+    if reuse_full_reference and args.seed != 123:
+        raise ValueError("The compact reused reference is frozen to seed 123.")
+    variants = args.variants or (
+        COMPACT_ABLATIONS if reuse_full_reference else ABLATION_VARIANTS
+    )
     if len(set(variants)) != len(variants):
         raise ValueError("--variants must not contain duplicates.")
     unknown = sorted(set(variants) - set(ABLATION_VARIANTS))
     if unknown:
         raise ValueError(f"Unknown ablation variants: {unknown}.")
-    if "none" not in variants:
+    if reuse_full_reference:
+        variants = tuple(variant for variant in variants if variant != "none")
+    elif "none" not in variants:
         variants = ("none",) + tuple(variants)
     if args.domain == "quasi":
         variants = tuple(
@@ -2024,6 +2034,10 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             else None
         ),
         "inherited_hyperparameters": inherited_hyperparameters,
+        "reference_source": (
+            str(Path(args.best_result).resolve()) if reuse_full_reference else None
+        ),
+        "reference_retrained": not reuse_full_reference,
     }
 
     _prepare_resumable_study(
@@ -2076,9 +2090,41 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
         _write_study_rows(study_dir / "ablation_results.csv", rows)
         write_json(study_dir / "ablation_results.json", rows)
     completed = [row for row in rows if row["status"] == "completed"]
-    reference = next(
-        (row for row in completed if row["variant"] == "none"), None
-    )
+    reference = None
+    if reuse_full_reference:
+        reference_payload = json.loads(
+            Path(args.best_result).read_text(encoding="utf-8")
+        )
+        final_result = reference_payload.get("final_result")
+        checkpoint = reference_payload.get("best_checkpoint")
+        if not isinstance(final_result, dict) or not checkpoint:
+            raise ValueError(
+                "The reused Stage-B reference must contain final_result and "
+                "best_checkpoint."
+            )
+        checkpoint_path = Path(str(checkpoint)).expanduser().resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Reused full-model checkpoint does not exist: {checkpoint_path}"
+            )
+        reference = {
+            "order": -1,
+            "variant": "none",
+            **ablation_metadata("none"),
+            "status": "reused",
+            "seed": 123,
+            "best_validation_nmse_linear": final_result[
+                "best_validation_nmse_linear"
+            ],
+            "best_validation_nmse_db": final_result["best_validation_nmse_db"],
+            "checkpoint": str(checkpoint_path),
+            "reference_source": str(Path(args.best_result).resolve()),
+            "reference_retrained": False,
+        }
+    else:
+        reference = next(
+            (row for row in completed if row["variant"] == "none"), None
+        )
     if reference is None:
         raise RuntimeError(
             f"The full-model reference failed; inspect {study_dir / 'ablation_results.json'}."
@@ -2106,6 +2152,10 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "one_factor_changed_per_variant": True,
         },
         "full_model": reference,
+        "reference_source": (
+            str(Path(args.best_result).resolve()) if reuse_full_reference else None
+        ),
+        "reference_retrained": not reuse_full_reference,
         "results": completed,
         "failed": [row for row in rows if row["status"] == "failed"],
     }
@@ -2967,10 +3017,19 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     ablate.add_argument(
+        "--reuse-full-reference",
+        action="store_true",
+        help=(
+            "Reuse the seed-123 Stage-B/C full-model result as the ablation "
+            "reference instead of retraining variant none."
+        ),
+    )
+    ablate.add_argument(
         "--variants",
         type=strings,
         help=(
-            "Comma-separated variants. The full model is always included. "
+            "Comma-separated variants. The full model is trained unless "
+            "--reuse-full-reference is supplied. "
             f"Available: {','.join(ABLATION_VARIANTS)}"
         ),
     )

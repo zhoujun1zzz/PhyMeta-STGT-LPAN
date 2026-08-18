@@ -21,6 +21,11 @@ LOSS_ABLATIONS = (
     "no_temporal_delta_loss",
 )
 ABLATION_VARIANTS = ("none",) + ARCHITECTURE_ABLATIONS + LOSS_ABLATIONS
+COMPACT_ABLATIONS = ARCHITECTURE_ABLATIONS + (
+    "no_charbonnier_loss",
+    "no_observation_loss",
+    "no_temporal_delta_loss",
+)
 ABLATION_METADATA = {
     "none": {
         "display_name": "Full model",

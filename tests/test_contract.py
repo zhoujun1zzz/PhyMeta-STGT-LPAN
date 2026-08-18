@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from lpan.engine import (
 )
 from lpan.metrics import MetricAccumulator
 from lpan.models import (
+    AlignedTemporalDecoder,
     LPANLResidualBlock,
     build_model,
     expand_observations_to_grid,
@@ -63,6 +65,10 @@ from main import (
 )
 from lpan.graph import ris_index_to_grid
 from scripts.verify_data_semantics import verify_mobility
+from scripts.run_v1_repair_protocol import (
+    COMPACT_ABLATIONS as REPAIR_COMPACT_ABLATIONS,
+    validate_training_run as validate_reused_training_run,
+)
 
 
 def write_mat(path: Path, domain: str, samples: int = 3) -> None:
@@ -623,6 +629,270 @@ def test_backward_optimizer_and_future_gru_outputs() -> None:
             for parameter in model.parameters()
         )
         optimizer.step()
+
+
+def test_spatial_gcn_far_node_is_conditioned_by_dense_interpolation_prior() -> None:
+    torch.manual_seed(20260818)
+    model = build_model(
+        "spatial_gcn", domain="quasi", hidden=16, graph_layers=2, heads=4
+    )
+    model.eval()
+    baseline = collate_sample("quasi")
+    baseline["obs_h"].zero_()
+    changed = {key: value.clone() for key, value in baseline.items()}
+    changed["obs_h"][0, 0, 0, 0, 0] = 1.0
+
+    far_node = 4  # four grid hops from observed node 0 and node 8
+    with torch.no_grad():
+        baseline_state = model.encode(baseline)
+        changed_state = model.encode(changed)
+
+    assert not torch.allclose(
+        baseline_state[:, :, far_node], changed_state[:, :, far_node]
+    )
+
+
+def test_aligned_temporal_decoder_uses_observed_states_without_transition() -> None:
+    class ZeroTimeFeatures(torch.nn.Module):
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return torch.zeros(value.shape[0], 2, dtype=value.dtype, device=value.device)
+
+    class CountingCell(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def forward(
+            self, value: torch.Tensor, hidden: torch.Tensor
+        ) -> torch.Tensor:
+            self.calls += 1
+            return hidden + 1
+
+    decoder = AlignedTemporalDecoder(2)
+    decoder.time_encoder = ZeroTimeFeatures()
+    cell = CountingCell()
+    decoder.cell = cell
+    observed = torch.tensor([[[10.0, 11.0], [20.0, 21.0]]])
+    query_time = torch.tensor([3, 0, 5, 1, 2, 4])
+
+    decoded = decoder(observed, torch.tensor([0, 1]), query_time)
+
+    assert torch.equal(decoded[:, 1], observed[:, 0])
+    assert torch.equal(decoded[:, 3], observed[:, 1])
+    assert torch.equal(decoded[:, 4], observed[:, 1] + 1)  # t=2
+    assert torch.equal(decoded[:, 0], observed[:, 1] + 2)  # t=3
+    assert torch.equal(decoded[:, 5], observed[:, 1] + 3)  # t=4
+    assert torch.equal(decoded[:, 2], observed[:, 1] + 4)  # t=5
+    assert cell.calls == 4
+
+
+@pytest.mark.parametrize("model_name", ["cnn_gru", "gcn_gru"])
+def test_gru_baselines_pass_both_observed_states_to_aligned_decoder(
+    model_name: str,
+) -> None:
+    class CaptureDecoder(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_states: torch.Tensor | None = None
+            self.obs_time: torch.Tensor | None = None
+            self.query_time: torch.Tensor | None = None
+
+        def forward(
+            self,
+            observed_states: torch.Tensor,
+            obs_time: torch.Tensor,
+            query_time: torch.Tensor,
+        ) -> torch.Tensor:
+            self.observed_states = observed_states
+            self.obs_time = obs_time
+            self.query_time = query_time
+            return observed_states[:, -1:].expand(-1, query_time.numel(), -1)
+
+    model = build_model(
+        model_name, domain="mobility", hidden=8, graph_layers=1, heads=4
+    )
+    capture = CaptureDecoder()
+    model.time_decoder = capture
+    batch = collate_sample("mobility")
+
+    prediction = model(batch)
+
+    assert prediction.shape == batch["target_h"].shape
+    assert capture.observed_states is not None
+    assert capture.observed_states.shape[1] == 2
+    assert torch.equal(capture.obs_time, torch.tensor([0, 1]))
+    assert torch.equal(capture.query_time, torch.arange(6))
+
+
+def test_cnn_gru_registry_preserves_requested_hidden_size() -> None:
+    model = build_model("cnn_gru", domain="mobility", hidden=64)
+    assert model.hidden == 64
+    assert model.gru.input_size == 64
+    assert model.gru.hidden_size == 64
+
+
+def test_repair_compact_ablation_set_is_eight_strict_one_factor_variants() -> None:
+    assert len(REPAIR_COMPACT_ABLATIONS) == 8
+    assert "none" not in REPAIR_COMPACT_ABLATIONS
+    assert "nmse_only" not in REPAIR_COMPACT_ABLATIONS
+
+
+def test_reuse_validator_checks_model_domain_seed_and_semantics(tmp_path: Path) -> None:
+    run_dir = tmp_path / "mobility_edsr_lite_seed123"
+    results = run_dir / "results"
+    checkpoints = run_dir / "checkpoints"
+    results.mkdir(parents=True)
+    checkpoints.mkdir(parents=True)
+    (results / "final_result.json").write_text(
+        json.dumps(
+            {
+                "status": "validation",
+                "epochs_completed": 40,
+                "best_validation_nmse_linear": 0.1,
+                "best_validation_nmse_db": -10.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    checkpoint = checkpoints / "best_checkpoint.pth"
+    torch.save(
+        {
+            "model_name": "edsr_lite",
+            "metadata": {
+                "domain": "mobility",
+                "seed": 123,
+                "semantic_profile": "official_lpan",
+                "complex_layout": "grouped",
+                "obs_time_index": [0, 1],
+                "obs_ris_index": list(range(0, 256, 8)),
+            },
+        },
+        checkpoint,
+    )
+
+    entry = validate_reused_training_run(
+        run_dir,
+        model="edsr_lite",
+        domain="mobility",
+        seed=123,
+        source_commit="unit-test",
+        stage="D",
+    )
+    assert entry["status"] == "reused"
+    assert entry["reason"] == "trusted_unaffected"
+
+    state = torch.load(checkpoint, weights_only=False)
+    state["metadata"]["complex_layout"] = "interleaved"
+    torch.save(state, checkpoint)
+    with pytest.raises(ValueError, match="semantic metadata mismatch"):
+        validate_reused_training_run(
+            run_dir,
+            model="edsr_lite",
+            domain="mobility",
+            seed=123,
+            source_commit="unit-test",
+            stage="D",
+        )
+
+
+def test_compact_ablation_reuses_reference_without_training_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkpoint = tmp_path / "best_checkpoint.pth"
+    checkpoint.touch()
+    best_result = tmp_path / "best_result.json"
+    best_result.write_text(
+        json.dumps(
+            {
+                "status": "validation_search",
+                "domain": "mobility",
+                "best_hyperparameters": {
+                    "hidden": 16,
+                    "graph_layers": 1,
+                    "heads": 4,
+                    "dropout": 0.0,
+                    "learning_rate": 2e-4,
+                    "weight_decay": 1e-5,
+                },
+                "best_checkpoint": str(checkpoint),
+                "final_result": {
+                    "best_validation_nmse_linear": 0.01,
+                    "best_validation_nmse_db": -20.0,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    called: list[str] = []
+
+    def fake_trial(args, study_dir, run_name, **overrides):
+        variant = str(overrides["ablation"])
+        called.append(variant)
+        run_dir = tmp_path / "trials" / run_name
+        (run_dir / "checkpoints").mkdir(parents=True)
+        (run_dir / "checkpoints" / "best_checkpoint.pth").touch()
+        return {
+            "run_dir": str(run_dir),
+            "result": {
+                "best_validation_nmse_linear": 0.02,
+                "best_validation_nmse_db": -17.0,
+            },
+        }
+
+    monkeypatch.setattr(experiment_main, "_run_or_resume_study_trial", fake_trial)
+    args = experiment_parser().parse_args(
+        [
+            "ablate",
+            "--domain",
+            "mobility",
+            "--mode",
+            "smoke",
+            "--best-result",
+            str(best_result),
+            "--reuse-full-reference",
+            "--variants",
+            ",".join(REPAIR_COMPACT_ABLATIONS),
+            "--output-root",
+            str(tmp_path / "ablation"),
+            "--study-name",
+            "compact",
+        ]
+    )
+
+    summary = ablate_command(args)
+
+    assert called == list(REPAIR_COMPACT_ABLATIONS)
+    assert summary["reference_retrained"] is False
+    assert summary["full_model"]["status"] == "reused"
+    assert summary["full_model"]["checkpoint"] == str(checkpoint.resolve())
+
+
+@pytest.mark.parametrize("model_name", ["cnn_gru", "gcn_gru"])
+def test_repaired_gru_baseline_tiny_overfit_sanity(model_name: str) -> None:
+    torch.manual_seed(20260818)
+    model = build_model(
+        model_name, domain="mobility", hidden=4, graph_layers=1, heads=1
+    )
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    output_layer = model.head if model_name == "cnn_gru" else model.output
+    for parameter in output_layer.parameters():
+        parameter.requires_grad_(True)
+    batch = collate_sample("mobility")
+    target = torch.zeros_like(batch["target_h"])
+    optimizer = torch.optim.Adam(output_layer.parameters(), lr=0.05)
+
+    with torch.no_grad():
+        initial = torch.mean(model(batch).square()).item()
+    for _ in range(12):
+        optimizer.zero_grad()
+        loss = torch.mean((model(batch) - target).square())
+        loss.backward()
+        optimizer.step()
+    with torch.no_grad():
+        final = torch.mean(model(batch).square()).item()
+
+    assert final < 0.8 * initial
 
 
 def test_cnn_grid_expansion_respects_observed_indices() -> None:

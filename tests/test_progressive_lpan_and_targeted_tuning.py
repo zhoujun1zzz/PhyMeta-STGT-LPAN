@@ -313,7 +313,11 @@ def test_targeted_protocol_scratch_trials_and_exact_final_resume(
     assert [call.epochs for call in learning_rate_calls] == [40, 40, 40]
     assert all(call.resume is None for call in learning_rate_calls)
     assert all(call.seed == 123 for call in learning_rate_calls)
-    assert final_call.resume.endswith("final/checkpoints/last_checkpoint.pth")
+    assert Path(final_call.resume).parts[-3:] == (
+        "final",
+        "checkpoints",
+        "last_checkpoint.pth",
+    )
     assert final_call.epochs == 100
     assert result["phase_c_resume_source_epoch"] == 40
     assert result["test_split_used"] is False
