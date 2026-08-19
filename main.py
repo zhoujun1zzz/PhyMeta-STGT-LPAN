@@ -55,6 +55,7 @@ from lpan.studies import (
     architectural_ablation,
     hyperparameter_candidates,
 )
+from lpan.transfer import ADAPTATION_MODES, file_sha256
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -587,25 +588,28 @@ def validate_training_request(
     resume: str | None,
     ablation: str = "none",
 ) -> None:
+    adaptation = adaptation.replace("-", "_")
     if pretrained and resume:
         raise ValueError("--pretrained and --resume cannot be used together.")
+    if adaptation == "scratch" and pretrained:
+        raise ValueError("scratch must use random initialization without --pretrained.")
     if pretrained and model_name != "phymeta_stgt":
         raise ValueError(
             "--pretrained transfer is only supported for phymeta_stgt."
         )
-    if adaptation != "full" and model_name != "phymeta_stgt":
+    if adaptation not in {"full", "scratch"} and model_name != "phymeta_stgt":
         raise ValueError(
             "Non-full adaptation is only supported for phymeta_stgt."
         )
-    if not pretrained and not resume and adaptation != "full":
+    if not pretrained and not resume and adaptation not in {"full", "scratch"}:
         raise ValueError(
             "Non-full adaptation requires a pretrained checkpoint. "
-            "Use --adaptation full for scratch training."
+            "Use --adaptation scratch for target-only training."
         )
     if ablation != "none" and model_name != "phymeta_stgt":
         raise ValueError("Ablations are only supported for phymeta_stgt.")
-    if ablation != "none" and adaptation != "full":
-        raise ValueError("Ablation runs require --adaptation full.")
+    if ablation != "none" and adaptation not in {"full", "scratch"}:
+        raise ValueError("Ablation runs require --adaptation scratch.")
 
 
 def load_pretrained_checkpoint(
@@ -647,12 +651,28 @@ def load_pretrained_checkpoint(
             f"Pretrained checkpoint weights are incompatible:\n{exc}"
         ) from exc
     source_metadata = state.get("metadata")
+    source_domain = (
+        source_metadata.get("domain")
+        if isinstance(source_metadata, dict)
+        else None
+    )
+    if current_config.get("domain") == "mobility" and source_domain != "quasi":
+        raise ValueError(
+            "Mobility transfer requires a Quasi-static source checkpoint; "
+            f"checkpoint metadata reports {source_domain!r}."
+        )
     return {
         "path": str(Path(checkpoint).expanduser().resolve()),
+        "sha256": (
+            file_sha256(checkpoint)
+            if Path(checkpoint).expanduser().is_file()
+            else None
+        ),
         "model_name": state["model_name"],
         "model_config": saved_config,
-        "source_domain": (
-            source_metadata.get("domain")
+        "source_domain": source_domain,
+        "source_seed": (
+            source_metadata.get("seed")
             if isinstance(source_metadata, dict)
             else None
         ),
@@ -725,7 +745,26 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             config,
             args.pretrained,
         )
+        if (
+            args.adaptation in ADAPTATION_MODES
+            and args.adaptation != "scratch"
+            and pretrained_metadata.get("source_seed") != 123
+        ):
+            raise ValueError(
+                "Formal transfer requires a Quasi-static seed-123 source "
+                "checkpoint with recorded seed metadata."
+            )
     adaptation = configure_adaptation(model, args.adaptation)
+    print("TRAINABLE PARAMETER GROUPS")
+    print(json.dumps(adaptation["trainable_module_names"], ensure_ascii=False))
+    print("FROZEN PARAMETER GROUPS")
+    print(json.dumps(adaptation["frozen_module_names"], ensure_ascii=False))
+    print(
+        "trainable params="
+        f"{adaptation['trainable_parameters']} total params="
+        f"{adaptation['total_parameters']} trainable ratio="
+        f"{adaptation['trainable_ratio_percent']:.6f}%"
+    )
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
         lr=float(training_profile["initial_learning_rate"]),
@@ -774,11 +813,18 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "complex_layout": args.complex_layout,
         "semantic_profile": args.semantic_profile,
         "train_fraction": args.fraction,
+        "train_subset": {
+            "size": len(train_loader.dataset),
+            "total_samples_in_file": train_loader.dataset.total_samples_in_file,
+            "sha256": train_loader.dataset.subset_hash,
+            "seed": train_loader.dataset.subset_seed,
+        },
         "adaptation": args.adaptation,
         "ablation": ablation,
         "architectural_ablation": architectural_ablation(ablation),
         "adaptation_parameters": adaptation,
         "pretrained": pretrained_metadata,
+        "test_split_used": False,
         "train_path": str(train_loader.dataset.path),
         "validation_path": str(val_loader.dataset.path),
         "max_train": max_train,
@@ -791,6 +837,16 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "training_profile": training_profile,
         "grad_clip": args.grad_clip,
         "early_stopping": stopping,
+        "runtime": {
+            "pytorch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "device": str(device),
+            "gpu": (
+                torch.cuda.get_device_name(device)
+                if device.type == "cuda"
+                else None
+            ),
+        },
         "loss_weights": {
             "nmse": weights.nmse,
             "charbonnier": weights.charbonnier,
@@ -977,6 +1033,10 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         ) as handle:
             handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {command}\n")
 
+    previous_adaptation_seconds = sum(
+        float(row.get("epoch_seconds", 0.0)) for row in history
+    )
+    adaptation_started = time.perf_counter()
     stopped_early = False
     stop_reason = None
     for epoch in range(start_epoch, epochs + 1):
@@ -1061,6 +1121,9 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             )
             print(f"Early stopping at epoch {epoch}: {stop_reason}")
             break
+    adaptation_seconds = previous_adaptation_seconds + (
+        time.perf_counter() - adaptation_started
+    )
     complexity = profile_model_complexity(
         model, canonical_batch(domain, batch_size=1, device=device)
     )
@@ -1072,6 +1135,8 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "max_epochs": epochs,
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,
+        "adaptation_seconds": adaptation_seconds,
+        "adaptation_minutes": adaptation_seconds / 60.0,
         "history": history,
         "metadata": metadata,
         "parameters": model_parameter_report(model),
@@ -2864,7 +2929,8 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--delta-weight", type=float, default=0.05)
     train.add_argument(
         "--adaptation",
-        choices=["full", "frozen_spatial", "adapter_only", "selective"],
+        choices=list(ADAPTATION_MODES)
+        + ["full", "adapter_only", "selective"],
         default="full",
     )
     train.add_argument("--pretrained")

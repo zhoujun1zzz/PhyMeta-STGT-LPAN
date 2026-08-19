@@ -15,6 +15,7 @@ from torch import nn
 
 from .metrics import MetricAccumulator
 from .objectives import LossWeights, combined_loss, progressive_charbonnier_loss
+from .transfer import configure_adaptation, enforce_frozen_module_eval
 
 
 def move_batch(
@@ -52,6 +53,7 @@ def train_epoch(
     loss_profile: str = "combined",
 ) -> dict[str, float]:
     model.train()
+    enforce_frozen_module_eval(model)
     totals: dict[str, float] = {}
     batches = 0
     for cpu_batch in loader:
@@ -93,6 +95,7 @@ def train_balanced_joint_epoch(
 ) -> dict[str, float]:
     """Alternate homogeneous task batches, preventing invalid label padding."""
     model.train()
+    enforce_frozen_module_eval(model)
     iterators = [iter(loader) for loader in loaders]
     totals: dict[str, float] = {}
     count = 0
@@ -117,60 +120,6 @@ def train_balanced_joint_epoch(
             totals[key] = totals.get(key, 0.0) + value
         count += 1
     return {key: value / max(1, count) for key, value in totals.items()}
-
-
-def configure_adaptation(model: nn.Module, policy: str) -> dict[str, object]:
-    policy = policy.replace("-", "_")
-    if policy != "full" and not hasattr(model, "domain_embedding"):
-        raise ValueError(
-            f"{policy} adaptation is only supported by PhyMetaSTGT; "
-            "use policy='full' for baseline models."
-        )
-    for parameter in model.parameters():
-        parameter.requires_grad = True
-    if policy == "full":
-        pass
-    elif policy == "frozen_spatial":
-        if not hasattr(model, "spatial_parameters"):
-            raise ValueError("frozen_spatial requires PhyMetaSTGT.")
-        for parameter in model.spatial_parameters():
-            parameter.requires_grad = False
-    elif policy in {"adapter_only", "selective"}:
-        adapter_tokens = ("domain_embedding",)
-        selective_tokens = adapter_tokens + (
-            "time_encoder",
-            "temporal_attention",
-            "temporal_norm",
-        )
-        allowed = adapter_tokens if policy == "adapter_only" else selective_tokens
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad = any(
-                name == token or name.startswith(f"{token}.") for token in allowed
-            )
-    else:
-        raise ValueError(
-            "policy must be full, frozen_spatial, adapter_only, or selective."
-        )
-    total = sum(parameter.numel() for parameter in model.parameters())
-    trainable = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
-    if trainable == 0:
-        raise ValueError(f"Adaptation policy {policy!r} selected no parameters.")
-    trainable_names = [
-        name for name, parameter in model.named_parameters() if parameter.requires_grad
-    ]
-    return {
-        "total_parameters": total,
-        "trainable_parameters": trainable,
-        "trainable_fraction": trainable / total,
-        "trainable_parameter_names": trainable_names,
-        "trainable_module_names": sorted(
-            {name.split(".", 1)[0] for name in trainable_names}
-        ),
-    }
 
 
 def save_checkpoint(

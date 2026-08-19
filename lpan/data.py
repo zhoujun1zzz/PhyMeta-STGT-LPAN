@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .transfer import deterministic_subset_indices, subset_index_hash
+
 
 @dataclass(frozen=True)
 class DatasetSpec:
@@ -158,15 +160,15 @@ class LPANH5Dataset(Dataset):
             self._validate_shapes(y_shape, h_shape)
             total = y_shape[3]
 
-        count = total if max_samples is None else min(total, int(max_samples))
-        count = max(1, int(np.floor(count * fraction)))
-        if fraction < 1.0 or max_samples is not None:
-            rng = np.random.default_rng(subset_seed)
-            # One seeded permutation makes fractions and max-sample caps nested.
-            indices = rng.permutation(total)[:count]
-            self.indices = np.sort(indices).astype(np.int64)
-        else:
-            self.indices = np.arange(count, dtype=np.int64)
+        self.indices = deterministic_subset_indices(
+            total,
+            fraction,
+            subset_seed,
+            max_samples=max_samples,
+        )
+        self.subset_seed = int(subset_seed)
+        self.fraction = float(fraction)
+        self.subset_hash = subset_index_hash(self.indices)
 
         self.total_samples_in_file = total
 

@@ -242,30 +242,28 @@ Joint training is not part of the frozen fast formal protocol. It remains option
 
 ### Parameter-efficient transfer
 
-First train a quasi-static PhyMeta-STGT checkpoint, then adapt it using a fixed fraction of the time-varying training split:
+The frozen Table 2 protocol uses Quasi-static pretraining followed by Mobility
+adaptation at `1%, 5%, 10%, 20%, 100%`, with seed 123 only. Use the dedicated
+runner rather than assembling individual commands:
 
 ```bash
-python main.py train --domain mobility --model phymeta_stgt --mode full \
-  --pretrained runs/quasi_stgt_seed123/checkpoints/best_checkpoint.pth \
-  --fraction 0.05 --adaptation selective --seed 123 \
-  --run-name transfer_5pct_selective_seed123
+python scripts/run_v1_lowdata_transfer.py --stage 1 \
+  --source-checkpoint /path/to/quasi_seed123/best_checkpoint.pth \
+  --run-root runs/v1_lowdata_transfer_seed123_<commit>_<timestamp> \
+  --data-root /path/to/data --device cuda
 ```
 
-Supported adaptation protocols are:
+The five formal policies are `scratch`, `full_finetune`, `frozen_spatial`,
+`domain_adapter_only`, and `adapter_head`. Scratch rejects a source checkpoint;
+all other policies require one. `adapter_head` trains the domain-conditioned
+FiLM embedding and prediction decoder, while `frozen_spatial` additionally
+trains the temporal stack. The runner shares one deterministic nested subset
+per fraction across all methods, never opens the test split, validates exact
+historical reuse, and records measured counts and timing in manifests.
 
-| Protocol | Option |
-|---|---|
-| Target-only training | omit `--pretrained` and use `--adaptation full` |
-| Full fine-tuning | `--adaptation full` |
-| Frozen spatial encoder | `--adaptation frozen_spatial`: time path, domain adapter, and decoder |
-| Selective temporal adaptation | `--adaptation selective`: time path and domain adapter |
-| Domain adapter only | `--adaptation adapter_only`: domain embedding only |
-
-The trainable sets are strictly nested: `adapter_only < selective < frozen_spatial < full`. Every run records the exact trainable parameter names, top-level modules, counts, and fraction in its metadata; use that artifact when describing an adaptation result.
-
-Recommended target fractions are `0.01`, `0.05`, `0.10`, `0.20`, and `1.0`. For a fixed seed, subsets are nested prefixes of one shuffled index manifest so that every smaller support set is contained in the larger sets.
-
-The `--pretrained` option accepts only a structurally compatible PhyMeta-STGT checkpoint and performs strict model-configuration and state-dictionary validation.
+Complete commands, parameter boundaries, resume rules, and the single-seed
+summary format are documented in
+[`docs/v1_lowdata_transfer.md`](docs/v1_lowdata_transfer.md).
 
 ### Hyperparameter search
 
