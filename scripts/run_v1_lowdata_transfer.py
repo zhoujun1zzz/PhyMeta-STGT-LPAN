@@ -16,6 +16,11 @@ PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
 from lpan.paths import resolve_dataset_path  # noqa: E402
+from lpan.data import (  # noqa: E402
+    default_observed_ris_indices,
+    semantic_contract,
+    semantic_fingerprint,
+)
 from lpan.transfer import (  # noqa: E402
     ADAPTATION_MODES,
     deterministic_subset_indices,
@@ -43,6 +48,8 @@ REUSE_FIELDS = (
     "target.domain",
     "target.train_identity.size_bytes",
     "target.validation_identity.size_bytes",
+    "target.semantic_contract",
+    "target.semantic_fingerprint",
     "subset.size",
     "subset.sha256",
     "model",
@@ -54,6 +61,17 @@ REUSE_FIELDS = (
     "metric_definition",
     "test_split_used",
 )
+
+
+def mobility_semantic_identity() -> tuple[dict[str, object], str]:
+    contract = semantic_contract(
+        domain="mobility",
+        semantic_profile="official_lpan",
+        complex_layout="interleaved",
+        obs_time_index=(1, 4),
+        obs_ris_index=default_observed_ris_indices(),
+    )
+    return contract, semantic_fingerprint(contract)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -238,8 +256,9 @@ def expected_manifest(
     )
     commit = git_value("rev-parse", "HEAD")
     dirty = bool(git_value("status", "--porcelain"))
+    contract, fingerprint = mobility_semantic_identity()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "planned",
         "git": {"commit": commit, "dirty": dirty},
         "source": source,
@@ -247,6 +266,8 @@ def expected_manifest(
             "domain": "mobility",
             "train_identity": file_identity(train_path),
             "validation_identity": file_identity(val_path),
+            "semantic_contract": contract,
+            "semantic_fingerprint": fingerprint,
         },
         "method": method,
         "fraction": fraction,
@@ -314,6 +335,14 @@ def command_for(
         "train",
         "--domain",
         "mobility",
+        "--semantic-profile",
+        "official_lpan",
+        "--complex-layout",
+        "interleaved",
+        "--obs-times",
+        "1,4",
+        "--obs-ris-indices",
+        ",".join(str(value) for value in default_observed_ris_indices()),
         "--model",
         "phymeta_stgt",
         "--mode",
@@ -420,6 +449,11 @@ def complete_manifest(
     metadata = result.get("metadata")
     if not isinstance(metadata, dict):
         raise ValueError("Training result metadata is missing.")
+    actual_contract = metadata.get("semantic_contract")
+    if actual_contract != manifest["target"]["semantic_contract"]:
+        raise ValueError("Training result semantic contract does not match the plan.")
+    if metadata.get("semantic_fingerprint") != manifest["target"]["semantic_fingerprint"]:
+        raise ValueError("Training result semantic fingerprint does not match the plan.")
     actual_subset = metadata.get("train_subset")
     if not isinstance(actual_subset, dict) or actual_subset.get("sha256") != manifest["subset"]["sha256"]:
         raise ValueError("Training subset hash does not match the planned manifest.")

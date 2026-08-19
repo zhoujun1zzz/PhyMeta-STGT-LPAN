@@ -56,8 +56,10 @@ def canonical_batch(
         "obs_ris_index": torch.arange(
             0, 256, 8, dtype=torch.long, device=target_device
         ).unsqueeze(0).expand(batch_size, -1),
-        "obs_time_index": torch.arange(
-            observed_blocks, dtype=torch.long, device=target_device
+        "obs_time_index": torch.tensor(
+            [0] if domain == "quasi" else [1, 4],
+            dtype=torch.long,
+            device=target_device,
         ).unsqueeze(0).expand(batch_size, -1),
         "query_time": torch.arange(
             query_blocks, dtype=torch.long, device=target_device
