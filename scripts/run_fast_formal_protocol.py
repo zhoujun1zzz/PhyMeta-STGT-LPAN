@@ -131,6 +131,20 @@ class FormalPipeline:
             "formal_seeds": list(SEEDS),
             "joint_training_in_main_protocol": False,
             "resume_safe_orchestration": True,
+            "semantic_contract": {
+                "quasi": {
+                    "complex_layout": "single_pair_equivalent",
+                    "obs_time_index": [0],
+                    "query_time": [0],
+                    "obs_ris_index": list(range(0, 256, 8)),
+                },
+                "mobility": {
+                    "complex_layout": "interleaved",
+                    "obs_time_index": [1, 4],
+                    "query_time": list(range(6)),
+                    "obs_ris_index": list(range(0, 256, 8)),
+                },
+            },
         }
 
     def save_state(self) -> None:

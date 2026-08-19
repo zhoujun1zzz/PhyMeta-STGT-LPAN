@@ -1,16 +1,17 @@
 # V1 repaired baselines and compact ablation protocol
 
-This protocol repairs only the audited Spatial GCN, CNN-GRU and GCN-GRU
-baselines at source commit `d51be59183456af81591993ae2458f46153718ca`.
-LPAN, LPAN-L, EDSR-lite, Stage B and Stage C are not retrained. Existing formal
-and historical run directories are read-only.
+This document describes the earlier repair protocol at source commit
+`d51be59183456af81591993ae2458f46153718ca`. Its Mobility reuse assumptions are
+superseded by `v1_mobility_semantic_correction.md`. Existing formal and
+historical run directories remain read-only.
 
 ## Frozen task and metric contracts
 
 - Quasi input/target: `[B,1,32,64,2] -> [B,1,256,64,2]`.
 - Mobility input/target: `[B,2,32,64,2] -> [B,6,256,64,2]` inside one sample.
 - Observed RIS: `0,8,...,248` on `index = 16 * row + column`.
-- Complex layout: grouped; Mobility observed time `[0,1]`, query time `[0..5]`.
+- Corrected Mobility raw layout: interleaved; observed time `[1,4]`, query time
+  `[0..5]`. Earlier grouped/`[0,1]` artifacts are legacy-only.
 - Main metric: mean of sample-level linear NMSE, converted to dB only after the
   linear mean.
 - Training, early stopping and selection use train/validation only. The repair
@@ -23,22 +24,19 @@ every observed block. Each of its 256 node tokens contains the interpolated 128
 real channel features, the true sparse observation mask and normalized physical
 coordinates. The shallow GCN is a residual refinement, not the mechanism that
 must diffuse observations across the whole grid. On Mobility, this model is
-only a spatial control: query 0 uses observed block 0 and query 1--5 hold the
-spatial output from observed block 1.
+only a spatial control using anchor interpolation between q1/q4 and nearest
+extension outside the anchors.
 
-CNN-GRU and GCN-GRU retain the GRU output sequence. Query 0 directly decodes h0
-and query 1 directly decodes h1. Only future queries 2, 3, 4 and 5 enter the
-autoregressive GRUCell. GCN-GRU uses the same interpolated dense prior before
-graph refinement. CNN-GRU receives the requested hidden width directly; the old
-implicit `/2` registry transform is removed.
+CNN-GRU and GCN-GRU retain the GRU output sequence. q1/q4 directly use their
+observed states. q0/q2/q3/q5 use piecewise-linear anchor states with nearest
+extension, followed by one time-conditioned GRUCell update. GCN-GRU uses the
+same interpolated dense prior before graph refinement.
 
 ## Result classifications
 
-Reused trusted formal results are Stage-A interpolation/Ridge, Stage-B tuning,
-Stage-C PhyMeta-STGT and Stage-D LPAN, LPAN-L and EDSR-lite. Repaired and rerun
-results are Quasi Spatial GCN, Mobility CNN-GRU/GCN-GRU, optional Mobility
-Spatial GCN control and the eight compact ablations. Old Spatial GCN, CNN-GRU
-and GCN-GRU results are retained as `legacy_invalid_for_final_comparison`.
+Only Quasi results remain reusable after the semantic correction. Every
+Mobility result from this protocol is retained as legacy evidence and must be
+rerun under the corrected contract.
 
 The runner verifies source commit, artifact existence, final training result,
 checkpoint existence, model name, domain, seed, semantic profile, complex

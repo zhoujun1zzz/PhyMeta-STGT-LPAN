@@ -90,12 +90,13 @@ def _load_checkpoint_metadata(path: Path) -> tuple[str, dict[str, object]]:
 def _validate_semantics(
     metadata: dict[str, object], *, domain: str, seed: int, checkpoint: Path
 ) -> None:
-    expected_obs_time = [0, 1] if domain == "mobility" else [0]
+    expected_obs_time = [1, 4] if domain == "mobility" else [0]
+    expected_layout = "interleaved" if domain == "mobility" else "grouped"
     checks = {
         "domain": (metadata.get("domain"), domain),
         "seed": (metadata.get("seed"), seed),
         "semantic_profile": (metadata.get("semantic_profile"), "official_lpan"),
-        "complex_layout": (metadata.get("complex_layout"), "grouped"),
+        "complex_layout": (metadata.get("complex_layout"), expected_layout),
         "obs_time_index": (metadata.get("obs_time_index"), expected_obs_time),
         "obs_ris_index": (metadata.get("obs_ris_index"), list(OFFICIAL_RIS)),
     }
@@ -208,11 +209,14 @@ def validate_stage_a_artifact(
         checks = {
             "split": (payload.get("split"), "validation"),
             "semantic_profile": (payload.get("semantic_profile"), "official_lpan"),
-            "complex_layout": (payload.get("complex_layout"), "grouped"),
+            "complex_layout": (
+                payload.get("complex_layout"),
+                "interleaved" if domain == "mobility" else "grouped",
+            ),
             "obs_ris_index": (payload.get("obs_ris_index"), list(OFFICIAL_RIS)),
             "obs_time_index": (
                 payload.get("obs_time_index"),
-                [0, 1] if domain == "mobility" else [0],
+                [1, 4] if domain == "mobility" else [0],
             ),
         }
         if any(actual != expected for actual, expected in checks.values()):

@@ -141,6 +141,15 @@ def exact_manifest(tmp_path: Path) -> dict[str, object]:
             "domain": "mobility",
             "train_identity": {"size_bytes": 100},
             "validation_identity": {"size_bytes": 20},
+            "semantic_contract": {
+                "domain": "mobility",
+                "semantic_profile": "official_lpan",
+                "complex_layout": "interleaved",
+                "obs_time_index": [1, 4],
+                "query_time": list(range(6)),
+                "obs_ris_index": list(range(0, 256, 8)),
+            },
+            "semantic_fingerprint": "canonical-semantic-hash",
         },
         "subset": {"size": 10, "sha256": "subset-hash"},
         "model": "phymeta_stgt",
@@ -165,6 +174,13 @@ def test_history_reuse_requires_exact_metadata_and_provenance(tmp_path: Path) ->
     reusable, reasons = validate_reuse(expected, candidate)
     assert reusable is False
     assert "subset.sha256" in reasons
+    legacy = copy.deepcopy(expected)
+    del legacy["target"]["semantic_contract"]  # type: ignore[index]
+    del legacy["target"]["semantic_fingerprint"]  # type: ignore[index]
+    reusable, reasons = validate_reuse(expected, legacy)
+    assert reusable is False
+    assert "target.semantic_contract" in reasons
+    assert "target.semantic_fingerprint" in reasons
 
 
 def test_runner_stage_counts_and_never_builds_test_cells() -> None:

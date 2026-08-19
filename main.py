@@ -22,7 +22,7 @@ from lpan.complexity import (
     canonical_batch,
     profile_model_complexity,
 )
-from lpan.data import LPANH5Dataset
+from lpan.data import LPANH5Dataset, semantic_contract, semantic_fingerprint
 from lpan.engine import (
     capture_rng_state,
     configure_adaptation,
@@ -84,7 +84,7 @@ def infer_semantic_profile(
     obs_ris_indices: object,
     complex_layout: object,
 ) -> str:
-    expected_times = (0, 1) if domain == "mobility" else (0,)
+    expected_times = (1, 4) if domain == "mobility" else (0,)
     try:
         times = tuple(obs_times)  # type: ignore[arg-type]
         indices = tuple(obs_ris_indices)  # type: ignore[arg-type]
@@ -94,7 +94,11 @@ def infer_semantic_profile(
         "official_lpan"
         if times == expected_times
         and indices == tuple(range(0, 256, 8))
-        and complex_layout == "grouped"
+        and (
+            complex_layout == "interleaved"
+            if domain == "mobility"
+            else complex_layout in {"grouped", "interleaved"}
+        )
         else "custom"
     )
 
@@ -135,7 +139,7 @@ def make_loader(
     seed: int = 123,
     obs_times: tuple[int, ...] | None = None,
     obs_ris_indices: tuple[int, ...] | None = None,
-    complex_layout: str = "grouped",
+    complex_layout: str | None = None,
     semantic_profile: str = "official_lpan",
     shuffle: bool = False,
 ) -> DataLoader:
@@ -284,14 +288,21 @@ def audit_command(args: argparse.Namespace) -> None:
             "obs_ris_index": list(args.obs_ris_indices),
             "mobility_obs_time_index": list(args.mobility_obs_times),
             "pilot_time_note": (
-                "The task definition confirms that the two pilot blocks are "
-                "the first two blocks of the six-block frame."
+                "The stored pilots are temporal anchors q1 and q4 within the "
+                "six-block frame; unobserved queries include interpolation "
+                "and two-sided extrapolation."
             ),
         },
         "files": [],
     }
+    audit_splits = (
+        ("train", "validation", "test")
+        if getattr(args, "include_test", False)
+        else ("train", "validation")
+    )
+    report["test_split_used"] = "test" in audit_splits
     for domain in ("quasi", "mobility"):
-        for split in ("train", "validation", "test"):
+        for split in audit_splits:
             candidates = dataset_candidates(data_root, domain, split)
             path = next(
                 (candidate for candidate in candidates if candidate.is_file()),
@@ -305,6 +316,8 @@ def audit_command(args: argparse.Namespace) -> None:
                 "valid": False,
                 "attempted_paths": [str(candidate) for candidate in candidates],
             }
+            if args.semantic_profile == "official_lpan" and domain == "mobility":
+                entry["expected_total_samples"] = MOBILITY_EXPECTED_SAMPLES[split]
             if path.is_file():
                 try:
                     entry["file_size_bytes"] = path.stat().st_size
@@ -343,7 +356,6 @@ def audit_command(args: argparse.Namespace) -> None:
                         and domain == "mobility"
                     ):
                         expected = MOBILITY_EXPECTED_SAMPLES[split]
-                        entry["expected_total_samples"] = expected
                         if dataset.total_samples_in_file != expected:
                             raise ValueError(
                                 f"Official Mobility {split} split expects "
@@ -809,6 +821,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         "mode": args.mode,
         "seed": args.seed,
         "obs_time_index": list(obs_times),
+        "query_time": list(range(1 if domain == "quasi" else 6)),
         "obs_ris_index": list(args.obs_ris_indices),
         "complex_layout": args.complex_layout,
         "semantic_profile": args.semantic_profile,
@@ -854,6 +867,15 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             "delta": weights.delta,
         },
     }
+    contract = semantic_contract(
+        domain=domain,
+        semantic_profile=args.semantic_profile,
+        complex_layout=args.complex_layout,
+        obs_time_index=obs_times,
+        obs_ris_index=args.obs_ris_indices,
+    )
+    metadata["semantic_contract"] = contract
+    metadata["semantic_fingerprint"] = semantic_fingerprint(contract)
     if hasattr(model, "protocol_metadata"):
         metadata["model_protocol"] = model.protocol_metadata()
     start_epoch, best_nmse = 1, float("inf")
@@ -2293,7 +2315,7 @@ def resolve_evaluation_semantics(
     obs_times = resolve(
         "obs_time_index",
         args.obs_times,
-        (0, 1) if domain == "mobility" else (0,),
+        (1, 4) if domain == "mobility" else (0,),
         sequence=True,
     )
     obs_ris_indices = resolve(
@@ -2305,7 +2327,7 @@ def resolve_evaluation_semantics(
     complex_layout = resolve(
         "complex_layout",
         args.complex_layout,
-        "grouped",
+        "interleaved" if domain == "mobility" else "grouped",
     )
     legacy_profile = infer_semantic_profile(
         domain,
@@ -2771,7 +2793,7 @@ def add_data_semantics(
     parser.add_argument(
         "--complex-layout",
         choices=["grouped", "interleaved"],
-        default=None if optional else "grouped",
+        default=None if optional else "interleaved",
         help="Raw real/imag channel ordering in Yd and Hd.",
     )
     parser.add_argument(
@@ -2797,7 +2819,7 @@ def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     parser.add_argument("--train-path")
     parser.add_argument("--val-path")
-    parser.add_argument("--obs-times", type=ints, default=(0, 1))
+    parser.add_argument("--obs-times", type=ints, default=(1, 4))
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--max-train", type=int)
     parser.add_argument("--max-val", type=int)
@@ -2836,7 +2858,12 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
 
     audit = commands.add_parser("audit")
-    audit.add_argument("--mobility-obs-times", type=ints, default=(0, 1))
+    audit.add_argument("--mobility-obs-times", type=ints, default=(1, 4))
+    audit.add_argument(
+        "--include-test",
+        action="store_true",
+        help="Inspect test metadata/sample only after the protocol is frozen.",
+    )
     audit.add_argument("--output", default="runs/data_audit.json")
     add_data_root(audit)
     add_data_semantics(audit)
@@ -2875,7 +2902,7 @@ def parser() -> argparse.ArgumentParser:
         "--domain", choices=["quasi", "mobility"], required=True
     )
     benchmark.add_argument("--train-path")
-    benchmark.add_argument("--obs-times", type=ints, default=(0, 1))
+    benchmark.add_argument("--obs-times", type=ints, default=(1, 4))
     benchmark.add_argument(
         "--candidates", type=ints, default=(16, 32, 64, 128)
     )
@@ -2913,7 +2940,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     train.add_argument("--train-path")
     train.add_argument("--val-path")
-    train.add_argument("--obs-times", type=ints, default=(0, 1))
+    train.add_argument("--obs-times", type=ints, default=(1, 4))
     train.add_argument("--fraction", type=float, default=1.0)
     train.add_argument("--max-train", type=int)
     train.add_argument("--max-val", type=int)
@@ -2989,7 +3016,7 @@ def parser() -> argparse.ArgumentParser:
     interpolation.add_argument("--domain", choices=["quasi", "mobility"], required=True)
     interpolation.add_argument("--split", choices=["validation", "test"], default="validation")
     interpolation.add_argument("--data-path")
-    interpolation.add_argument("--obs-times", type=ints, default=(0, 1))
+    interpolation.add_argument("--obs-times", type=ints, default=(1, 4))
     interpolation.add_argument("--spatial", choices=["linear", "nearest"], default="linear")
     interpolation.add_argument("--temporal", choices=["linear", "nearest"], default="linear")
     interpolation.add_argument("--max-samples", type=int)
@@ -3005,7 +3032,7 @@ def parser() -> argparse.ArgumentParser:
     ridge.add_argument("--train-path")
     ridge.add_argument("--val-path")
     ridge.add_argument("--test-path")
-    ridge.add_argument("--obs-times", type=ints, default=(0, 1))
+    ridge.add_argument("--obs-times", type=ints, default=(1, 4))
     ridge.add_argument("--lambdas", type=floats, default=(1e-6, 1e-4, 1e-2, 1.0))
     ridge.add_argument("--max-train", type=int)
     ridge.add_argument("--max-val", type=int)
@@ -3020,7 +3047,7 @@ def parser() -> argparse.ArgumentParser:
 
     joint = commands.add_parser("joint")
     joint.add_argument("--mode", choices=["smoke", "full"], default="smoke")
-    joint.add_argument("--obs-times", type=ints, default=(0, 1))
+    joint.add_argument("--obs-times", type=ints, default=(1, 4))
     joint.add_argument("--epochs", type=int, default=100)
     joint.add_argument("--steps-per-epoch", type=int)
     joint.add_argument("--eval-batch-size", type=int, default=64)

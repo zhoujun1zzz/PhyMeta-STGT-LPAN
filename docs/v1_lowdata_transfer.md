@@ -66,6 +66,13 @@ metadata, dataset identities, subset size/hash, model and optimization
 configuration, trainable counts, best validation metric/epoch, measured
 adaptation time, runtime versions, and `test_split_used=false`.
 
+After the Mobility semantic correction, every manifest also records the full
+canonical semantic contract (`semantic_profile`, `complex_layout`, q1/q4
+`obs_time_index`, q0..q5 `query_time`, and observed RIS indices) plus its SHA256
+fingerprint. Legacy grouped/q0-q1 manifests fail exact reuse validation. The
+completed legacy 25-cell run remains immutable but every cell must be rerun;
+its earlier frozen-strategy interpretation is withdrawn pending correction.
+
 Historical reuse requires an exact match for implementation commit, source
 checkpoint, datasets, fraction and subset hash, seed, optimizer/scheduler,
 training budget, validation protocol, metric definition, completed checkpoint,

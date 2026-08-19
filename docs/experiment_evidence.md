@@ -53,10 +53,10 @@ must not inherit the official model's `-19.7268 dB` test result.
 - Raw target: `[N, 12, 64, 256]`
 - Unified input: `[N, 2, 32, 64, 2]`
 - Unified target: `[N, 6, 256, 64, 2]`
-- Complex layout: grouped real time blocks followed by grouped imaginary time
-  blocks
-- Frame semantics: two pilot blocks reconstruct six target blocks inside one
-  sample
+- Raw Mobility layout: interleaved real/imaginary pairs per query block
+- Pilot positions: q1 and q4; query positions: q0 through q5
+- Frame semantics: two temporally sparse pilots reconstruct the complete
+  six-block frame inside one sample
 
 These labels belong to the `official_lpan` semantic profile. The loader rejects
 different pilot times, RIS indices, or complex layouts under that profile;
@@ -75,13 +75,13 @@ checkpoint-selection rule, seed policy and training budget. Hyperparameter
 selection uses validation only. The independent test split is evaluated only
 after the protocol and checkpoint have been frozen.
 
-## V1 repaired-baseline provenance boundary
+## Legacy V1 provenance boundary after the Mobility semantic correction
 
 The formal run rooted at `runs/formal_d51be59_20260817_005210` remains immutable.
-Its Stage-A interpolation/Ridge validation artifacts, Stage-B tuning, Stage-C
-PhyMeta-STGT, and Stage-D LPAN, LPAN-L and EDSR-lite training are trusted and may
-be referenced read-only by a new manifest. They must not be copied over, moved,
-renamed or rewritten by the repair protocol.
+Its Quasi results remain usable. Mobility artifacts were produced under the
+legacy `grouped + (0,1)` interpretation and may be referenced only as legacy
+evidence; they must not enter corrected comparison tables or new mean/std
+aggregations. They must not be copied over, moved, renamed, or rewritten.
 
 The old Spatial GCN results are labeled
 `legacy_invalid_for_final_comparison` because a shallow four-neighbor GCN was
@@ -92,14 +92,12 @@ decoding h0/h1. GCN-GRU also inherited the old zero-filled spatial
 initialization. These artifacts remain historical evidence but cannot enter the
 final comparison or a new mean/std aggregation.
 
-Repaired results must be produced in a new run root. Quasi Spatial GCN uses an
+Corrected results must be produced in a new run root. Quasi Spatial GCN uses an
 interpolated dense prior plus graph refinement. Mobility CNN-GRU and GCN-GRU use
-direct observed-state decoding and exactly four future recurrent steps. Mobility
-Spatial GCN, if reported, is explicitly a supplementary spatial-only control
-with last-observation hold. The compact ablation uses seed 123 and eight
-one-factor variants; its full-model reference is reused from Stage B/C and
-records `reference_retrained=false`. No repair or ablation selection may read
-the independent test split.
+exact observed states at q1/q4 plus a shared time-conditioned anchor decoder for
+q0/q2/q3/q5. Corrected Mobility PhyMeta-STGT, all Mobility baselines, and all
+Mobility ablations must be rerun. No repair or ablation selection may read the
+independent test split.
 
 ## Complexity reporting protocol
 

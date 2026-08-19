@@ -16,8 +16,8 @@ from lpan.models import (
     LPANResidualBlock,
     ProgressiveLPAN,
     build_model,
-    lpan_grouped_input,
-    lpan_grouped_output,
+    lpan_raw_input,
+    lpan_raw_output,
 )
 from lpan.objectives import (
     LossWeights,
@@ -98,22 +98,22 @@ def test_progressive_target_indices_are_exact() -> None:
     assert hr4.flatten().tolist() == list(range(1, 256, 2))
 
 
-def test_grouped_channel_order_round_trip() -> None:
+def test_official_raw_channel_order_round_trip() -> None:
     obs = torch.zeros(1, 2, 3, 1, 2)
     obs[0, 0, :, 0, 0] = 10
     obs[0, 1, :, 0, 0] = 20
     obs[0, 0, :, 0, 1] = 30
     obs[0, 1, :, 0, 1] = 40
-    grouped = lpan_grouped_input(obs)
-    assert grouped[:, :, 0, 0].tolist() == [[10, 20, 30, 40]]
+    raw = lpan_raw_input(obs)
+    assert raw[:, :, 0, 0].tolist() == [[10, 30, 20, 40]]
 
     output = torch.zeros(1, 12, 1, 3)
     for channel in range(12):
         output[:, channel] = channel
-    unified = lpan_grouped_output(output, query_blocks=6)
-    assert unified[0, :, 0, 0, 0].tolist() == list(range(6))
-    assert unified[0, :, 0, 0, 1].tolist() == list(range(6, 12))
-    assert torch.equal(lpan_grouped_input(unified), output)
+    unified = lpan_raw_output(output, query_blocks=6)
+    assert unified[0, :, 0, 0, 0].tolist() == list(range(0, 12, 2))
+    assert unified[0, :, 0, 0, 1].tolist() == list(range(1, 12, 2))
+    assert torch.equal(lpan_raw_input(unified), output)
 
 
 def test_block_fidelity_and_public_loop_equivalence() -> None:

@@ -106,7 +106,13 @@ Run the read-only dataset audit before training:
 python main.py audit --data-root /path/to/data
 ```
 
-The audit records file locations, byte sizes, HDF5 keys, raw shapes, dtypes, full sample counts, and canonical interface shapes. It reads metadata and one sample from each split. Under the default `official_lpan` profile, the Mobility counts must be exactly 20,000 training, 1,800 validation, and 9,000 test samples. The loader does not fit or apply an additional normalization transform; it consumes the upstream preprocessed tensors stored in the LPAN files.
+The audit records file locations, byte sizes, HDF5 keys, raw shapes, dtypes,
+full sample counts, and canonical interface shapes. By default it reads only
+train and validation metadata plus one sample, keeping test isolated until the
+protocol is frozen. `--include-test` is an explicit post-freeze option. Under
+the default `official_lpan` profile, Mobility train/validation counts must be
+20,000/1,800 (and test 9,000 when explicitly included). The loader does not fit
+or apply an additional normalization transform.
 
 ### Data semantics
 
@@ -114,24 +120,30 @@ For the official LPAN files, the implementation uses:
 
 ```text
 observed RIS indices: 0, 8, 16, ..., 248
-complex layout: grouped
+Mobility complex layout: interleaved
 grid index: 16 * row + column
-time-varying pilot blocks: 0, 1
+Mobility pilot/query positions: pilots q1 and q4; queries q0..q5
 ```
 
 The `16 x 16` RIS grid therefore contains observations at columns 0 and 8 of every row under zero-based indexing. The time-varying channel layout is:
 
 ```text
-Yd = [Re(t1), Re(t2), Im(t1), Im(t2)]
-Hd = [Re(t1), ..., Re(t6), Im(t1), ..., Im(t6)]
+Yd = [Re(q1), Im(q1), Re(q4), Im(q4)]
+Hd = [Re(q0), Im(q0), ..., Re(q5), Im(q5)]
 ```
+
+The loader converts this raw interleaved storage to the unified complex-last
+representation `[B,T,RIS,BS,2]`. Quasi-static has only one complex pair, so
+grouped and interleaved names are numerically equivalent there. The correction,
+full-validation evidence, and historical-result boundary are documented in
+[`docs/v1_mobility_semantic_correction.md`](docs/v1_mobility_semantic_correction.md).
 
 These labels are enforced by the default `--semantic-profile official_lpan`; changing only a label cannot silently reinterpret the same raw columns. Use `--semantic-profile custom` only for a separately rearranged or regenerated dataset whose column meanings have been independently verified:
 
 ```bash
 --obs-ris-indices 0,8,16,...,248
---complex-layout grouped
---obs-times 0,1
+--complex-layout interleaved
+--obs-times 1,4
 --semantic-profile custom
 ```
 
@@ -170,10 +182,11 @@ Smoke mode uses 64 training samples, 16 validation samples, and one epoch. Its o
 Spatial GCN now initializes every dense RIS node from the verified row-wise
 physical-grid interpolation, concatenates the sparse observation mask and
 normalized coordinates, and uses the GCN only as a residual graph refinement.
-On Mobility it is a spatial-only control: query 0 uses observed block 0 and all
-queries from 1 onward hold the spatial output of observed block 1. CNN-GRU and
-GCN-GRU directly decode the GRU states aligned with observed queries 0 and 1;
-their recurrent decoder is invoked only four times for future queries 2--5.
+On Mobility it is a spatial-only control using piecewise-linear hidden-state
+alignment between q1 and q4 with nearest extension at q0/q5. CNN-GRU and
+GCN-GRU return the observed GRU states exactly at q1/q4; q0, q2, q3, and q5 use
+the same anchor interpolation/extension policy followed by one time-conditioned
+GRUCell update. No query is assumed to be future-only.
 
 ### Progressive LPAN and LPAN-L baselines
 
@@ -397,7 +410,10 @@ Checkpoints preserve Python, NumPy, PyTorch CPU/CUDA, and DataLoader random stat
 
 `LPAN-L-Direct` must not be labeled as LPAN-L. The registered main LPAN-L option is the progressive model; historical external evidence and new in-repository runs must retain separate provenance.
 
-CNN-GRU and GCN-GRU encode the two pilot blocks and autoregressively decode positions `0..5`. They perform sequence-to-sequence reconstruction of the complete six-block frame, including the two pilot positions; they are not strict future-only predictors beginning at position 2.
+CNN-GRU and GCN-GRU encode the two sparse pilots at q1/q4. They directly use
+the aligned observed states at those positions and apply one shared,
+time-conditioned anchor decoder to q0/q2/q3/q5. The task is full-frame
+reconstruction, not future-only prediction.
 
 ## Evaluation and reproducibility
 

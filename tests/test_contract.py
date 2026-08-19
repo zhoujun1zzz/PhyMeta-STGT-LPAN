@@ -33,6 +33,7 @@ from lpan.models import (
     expand_observations_to_grid,
     grid_aware_spatial_interpolation_weights,
     interpolation_baseline,
+    linear_query_weights,
 )
 from lpan.objectives import (
     LossWeights,
@@ -90,7 +91,7 @@ def write_mat(path: Path, domain: str, samples: int = 3) -> None:
 
 def collate_sample(domain: str) -> dict[str, torch.Tensor]:
     t, q, domain_id = ((1, 1, 0) if domain == "quasi" else (2, 6, 1))
-    obs_times = [0] if domain == "quasi" else [0, 1]
+    obs_times = [0] if domain == "quasi" else [1, 4]
     return {
         "obs_h": torch.randn(1, t, 32, 64, 2),
         "target_h": torch.randn(1, q, 256, 64, 2),
@@ -606,7 +607,7 @@ def test_ablation_loads_stage_b_best_hyperparameters(tmp_path: Path) -> None:
         )
 
 
-def test_backward_optimizer_and_future_gru_outputs() -> None:
+def test_backward_optimizer_and_full_query_gru_outputs() -> None:
     batch = collate_sample("mobility")
     for name in ("cnn_gru", "gcn_gru"):
         model = build_model(
@@ -675,15 +676,32 @@ def test_aligned_temporal_decoder_uses_observed_states_without_transition() -> N
     observed = torch.tensor([[[10.0, 11.0], [20.0, 21.0]]])
     query_time = torch.tensor([3, 0, 5, 1, 2, 4])
 
-    decoded = decoder(observed, torch.tensor([0, 1]), query_time)
+    decoded = decoder(observed, torch.tensor([1, 4]), query_time)
 
-    assert torch.equal(decoded[:, 1], observed[:, 0])
-    assert torch.equal(decoded[:, 3], observed[:, 1])
-    assert torch.equal(decoded[:, 4], observed[:, 1] + 1)  # t=2
-    assert torch.equal(decoded[:, 0], observed[:, 1] + 2)  # t=3
-    assert torch.equal(decoded[:, 5], observed[:, 1] + 3)  # t=4
-    assert torch.equal(decoded[:, 2], observed[:, 1] + 4)  # t=5
-    assert cell.calls == 4
+    assert torch.equal(decoded[:, 3], observed[:, 0])  # q1 exact
+    assert torch.equal(decoded[:, 5], observed[:, 1])  # q4 exact
+    assert torch.equal(decoded[:, 1], observed[:, 0] + 1)  # q0 left extension
+    assert torch.equal(decoded[:, 2], observed[:, 1] + 1)  # q5 right extension
+    expected_q2 = (2 * observed[:, 0] + observed[:, 1]) / 3 + 1
+    expected_q3 = (observed[:, 0] + 2 * observed[:, 1]) / 3 + 1
+    assert torch.allclose(decoded[:, 4], expected_q2)
+    assert torch.allclose(decoded[:, 0], expected_q3)
+    assert cell.calls == 1
+
+
+def test_linear_query_weights_support_sparse_mobility_anchors() -> None:
+    weights = linear_query_weights(torch.tensor([1, 4]), torch.arange(6))
+    expected = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [2 / 3, 1 / 3],
+            [1 / 3, 2 / 3],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ]
+    )
+    assert torch.allclose(weights, expected)
 
 
 @pytest.mark.parametrize("model_name", ["cnn_gru", "gcn_gru"])
@@ -720,7 +738,7 @@ def test_gru_baselines_pass_both_observed_states_to_aligned_decoder(
     assert prediction.shape == batch["target_h"].shape
     assert capture.observed_states is not None
     assert capture.observed_states.shape[1] == 2
-    assert torch.equal(capture.obs_time, torch.tensor([0, 1]))
+    assert torch.equal(capture.obs_time, torch.tensor([1, 4]))
     assert torch.equal(capture.query_time, torch.arange(6))
 
 
@@ -762,8 +780,8 @@ def test_reuse_validator_checks_model_domain_seed_and_semantics(tmp_path: Path) 
                 "domain": "mobility",
                 "seed": 123,
                 "semantic_profile": "official_lpan",
-                "complex_layout": "grouped",
-                "obs_time_index": [0, 1],
+                "complex_layout": "interleaved",
+                "obs_time_index": [1, 4],
                 "obs_ris_index": list(range(0, 256, 8)),
             },
         },
@@ -782,7 +800,7 @@ def test_reuse_validator_checks_model_domain_seed_and_semantics(tmp_path: Path) 
     assert entry["reason"] == "trusted_unaffected"
 
     state = torch.load(checkpoint, weights_only=False)
-    state["metadata"]["complex_layout"] = "interleaved"
+    state["metadata"]["complex_layout"] = "grouped"
     torch.save(state, checkpoint)
     with pytest.raises(ValueError, match="semantic metadata mismatch"):
         validate_reused_training_run(
@@ -1394,6 +1412,19 @@ def test_observation_consistency_uses_mask_and_rejects_empty_sample() -> None:
         model(batch)
 
 
+def test_observation_consistency_selects_q1_and_q4() -> None:
+    batch = collate_sample("mobility")
+    batch["obs_h"] = torch.randn_like(batch["obs_h"])
+    prediction = torch.zeros_like(batch["target_h"])
+    ris = batch["obs_ris_index"][0]
+    prediction[:, 1, ris] = batch["obs_h"][:, 0]
+    prediction[:, 4, ris] = batch["obs_h"][:, 1]
+    assert observation_consistency(prediction, batch).item() == pytest.approx(0.0)
+    prediction[:, 0, ris] = batch["obs_h"][:, 0]
+    prediction[:, 1, ris] = batch["obs_h"][:, 1]
+    assert observation_consistency(prediction, batch).item() > 0
+
+
 def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
     corrupt = dataset_candidates(tmp_path, "quasi", "train")[0]
     corrupt.parent.mkdir(parents=True)
@@ -1404,9 +1435,9 @@ def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
         (),
         {
             "data_root": str(tmp_path),
-            "mobility_obs_times": (0, 1),
+            "mobility_obs_times": (1, 4),
             "obs_ris_indices": tuple(range(0, 256, 8)),
-            "complex_layout": "grouped",
+            "complex_layout": "interleaved",
             "semantic_profile": "official_lpan",
             "output": str(output),
         },
@@ -1417,7 +1448,8 @@ def test_audit_reports_corrupt_file_without_stopping(tmp_path: Path) -> None:
     assert entry["exists"] is True
     assert entry["valid"] is False
     assert "Not an HDF5" in entry["error"]
-    assert len(report["files"]) == 6
+    assert len(report["files"]) == 4
+    assert report["test_split_used"] is False
 
 
 def test_official_semantic_profile_and_audit_reject_wrong_evidence(
@@ -1425,12 +1457,17 @@ def test_official_semantic_profile_and_audit_reject_wrong_evidence(
 ) -> None:
     path = tmp_path / "mobility.mat"
     write_mat(path, "mobility", samples=3)
+    official = LPANH5Dataset(path, "mobility", "validation")
+    assert official.complex_layout == "interleaved"
+    assert official.obs_time_index == (1, 4)
+    official.close()
     with pytest.raises(ValueError, match="official_lpan semantic profile rejects"):
         LPANH5Dataset(
             path,
             "mobility",
             "validation",
-            complex_layout="interleaved",
+            complex_layout="grouped",
+            obs_time_index=(0, 1),
         )
     with pytest.raises(ValueError, match="official_lpan semantic profile rejects"):
         LPANH5Dataset(
@@ -1444,7 +1481,7 @@ def test_official_semantic_profile_and_audit_reject_wrong_evidence(
             path,
             "mobility",
             "validation",
-            obs_time_index=(1, 2),
+            obs_time_index=(0, 1),
         )
     custom = LPANH5Dataset(
         path,
@@ -1464,9 +1501,9 @@ def test_official_semantic_profile_and_audit_reject_wrong_evidence(
     output = tmp_path / "audit.json"
     args = argparse.Namespace(
         data_root=str(tmp_path),
-        mobility_obs_times=(0, 1),
+        mobility_obs_times=(1, 4),
         obs_ris_indices=tuple(range(0, 256, 8)),
-        complex_layout="grouped",
+        complex_layout="interleaved",
         semantic_profile="official_lpan",
         output=str(output),
     )
@@ -1579,16 +1616,42 @@ def test_mobility_layout_is_inferred_from_correlation_evidence(
     tmp_path: Path, layout: str
 ) -> None:
     rng = np.random.default_rng(42)
-    target = rng.normal(size=(8, 6, 256, 64)) + 1j * rng.normal(
-        size=(8, 6, 256, 64)
+    initial = rng.normal(size=(8, 1, 256, 64)) + 1j * rng.normal(
+        size=(8, 1, 256, 64)
     )
-    observed = target[:, :2, np.arange(0, 256, 8)]
+    innovations = 0.2 * (
+        rng.normal(size=(8, 5, 256, 64))
+        + 1j * rng.normal(size=(8, 5, 256, 64))
+    )
+    target = np.concatenate(
+        (initial, initial + np.cumsum(innovations, axis=1)), axis=1
+    )
+    if layout == "interleaved":
+        # Mirror the real-file raw duplicate evidence without encoding the
+        # expected pilot positions into the verifier.
+        target[:, 1].real = target[:, 0].real
+        target[:, 4].real = target[:, 3].real
+    observed = target[:, [1, 4]][:, :, np.arange(0, 256, 8)]
     path = tmp_path / f"{layout}.mat"
     with h5py.File(path, "w") as handle:
         handle["Yd"] = _encode_complex_layout(observed, layout)
         handle["Hd"] = _encode_complex_layout(target, layout)
     result = verify_mobility(path, samples=8)
     assert result["verified_layout"] == layout
+    assert result["verified_pilot_positions"] == [1, 4]
     assert result["layout_inference"]["status"] == "verified"
     expected_second_channel = "Re(t2)" if layout == "grouped" else "Im(t1)"
     assert result["raw_Yd_channels"][1] == expected_second_channel
+
+
+def test_mobility_semantic_inference_reports_ambiguous_without_margin(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ambiguous.mat"
+    with h5py.File(path, "w") as handle:
+        handle["Yd"] = np.zeros((4, 32, 64, 3), dtype=np.float32)
+        handle["Hd"] = np.zeros((12, 256, 64, 3), dtype=np.float32)
+    result = verify_mobility(path, samples=3)
+    assert result["layout_inference"]["status"] == "ambiguous"
+    assert result["verified_layout"] is None
+    assert result["verified_pilot_positions"] is None

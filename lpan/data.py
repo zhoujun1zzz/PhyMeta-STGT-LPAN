@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -23,10 +25,11 @@ class DatasetSpec:
 
 SPECS = {
     "quasi": DatasetSpec("quasi", 1, 1, 0, (0,)),
-    # The two pilot blocks are the first two blocks in the six-block frame.
-    "mobility": DatasetSpec("mobility", 2, 6, 1, (0, 1)),
+    # The two stored pilots are temporal anchors q1 and q4 in the frame.
+    "mobility": DatasetSpec("mobility", 2, 6, 1, (1, 4)),
 }
 SEMANTIC_PROFILES = ("official_lpan", "custom")
+OFFICIAL_COMPLEX_LAYOUT = {"quasi": "grouped", "mobility": "interleaved"}
 
 
 def default_observed_ris_indices() -> tuple[int, ...]:
@@ -64,9 +67,14 @@ def validate_semantic_profile(
             "expected": list(expected_times),
             "received": list(obs_time_index),
         }
-    if complex_layout != "grouped":
+    valid_layouts = (
+        {"grouped", "interleaved"}
+        if domain == "quasi"
+        else {OFFICIAL_COMPLEX_LAYOUT[domain]}
+    )
+    if complex_layout not in valid_layouts:
         mismatches["complex_layout"] = {
-            "expected": "grouped",
+            "expected": sorted(valid_layouts),
             "received": complex_layout,
         }
     if mismatches:
@@ -75,6 +83,43 @@ def validate_semantic_profile(
             f"the stored official columns: {mismatches}. Use profile='custom' "
             "only for an independently rearranged or regenerated dataset."
         )
+
+
+def semantic_contract(
+    *,
+    domain: str,
+    semantic_profile: str,
+    complex_layout: str,
+    obs_time_index: Sequence[int],
+    obs_ris_index: Sequence[int],
+) -> dict[str, object]:
+    """Return a canonical, serializable identity for dataset semantics."""
+    if domain not in SPECS:
+        raise ValueError(f"Unknown domain {domain!r}.")
+    contract = {
+        "domain": domain,
+        "semantic_profile": semantic_profile,
+        "complex_layout": complex_layout,
+        "obs_time_index": [int(value) for value in obs_time_index],
+        "query_time": list(range(SPECS[domain].query_blocks)),
+        "obs_ris_index": [int(value) for value in obs_ris_index],
+    }
+    validate_semantic_profile(
+        profile=semantic_profile,
+        domain=domain,
+        obs_ris_index=contract["obs_ris_index"],
+        obs_time_index=contract["obs_time_index"],
+        complex_layout=complex_layout,
+    )
+    return contract
+
+
+def semantic_fingerprint(contract: dict[str, object]) -> str:
+    """Hash a semantic contract using stable JSON serialization."""
+    canonical = json.dumps(
+        contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 class LPANH5Dataset(Dataset):
@@ -88,9 +133,7 @@ class LPANH5Dataset(Dataset):
         *,
         obs_ris_index: Sequence[int] | None = None,
         obs_time_index: Sequence[int] | None = None,
-        # Official LPAN mobility files store all real time blocks first,
-        # followed by all imaginary time blocks.
-        complex_layout: str = "grouped",
+        complex_layout: str | None = None,
         semantic_profile: str = "official_lpan",
         max_samples: int | None = None,
         fraction: float = 1.0,
@@ -109,6 +152,8 @@ class LPANH5Dataset(Dataset):
         self.domain = domain
         self.split = split
         self.spec = SPECS[domain]
+        if complex_layout is None:
+            complex_layout = OFFICIAL_COMPLEX_LAYOUT[domain]
         if complex_layout not in {"grouped", "interleaved"}:
             raise ValueError("complex_layout must be grouped or interleaved.")
         self.complex_layout = complex_layout
