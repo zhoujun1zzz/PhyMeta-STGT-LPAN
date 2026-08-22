@@ -110,7 +110,7 @@ The audit records file locations, byte sizes, HDF5 keys, raw shapes, dtypes,
 full sample counts, and canonical interface shapes. By default it reads only
 train and validation metadata plus one sample, keeping test isolated until the
 protocol is frozen. `--include-test` is an explicit post-freeze option. Under
-the default `official_lpan` profile, Mobility train/validation counts must be
+the default `v3_mobility_q0_q3` profile, Mobility train/validation counts must be
 20,000/1,800 (and test 9,000 when explicitly included). The loader does not fit
 or apply an additional normalization transform.
 
@@ -120,32 +120,58 @@ For the official LPAN files, the implementation uses:
 
 ```text
 observed RIS indices: 0, 8, 16, ..., 248
-Mobility complex layout: interleaved
+Mobility complex layout: grouped
 grid index: 16 * row + column
-Mobility pilot/query positions: pilots q1 and q4; queries q0..q5
+Mobility pilot/query positions: pilots q0 and q3; queries q0..q5
 ```
 
 The `16 x 16` RIS grid therefore contains observations at columns 0 and 8 of every row under zero-based indexing. The time-varying channel layout is:
 
 ```text
-Yd = [Re(q1), Im(q1), Re(q4), Im(q4)]
-Hd = [Re(q0), Im(q0), ..., Re(q5), Im(q5)]
+Yd = [Re(q0), Re(q3), Im(q0), Im(q3)]
+Hd = [Re(q0), ..., Re(q5), Im(q0), ..., Im(q5)]
 ```
 
-The loader converts this raw interleaved storage to the unified complex-last
+The loader converts this grouped storage to the unified complex-last
 representation `[B,T,RIS,BS,2]`. Quasi-static has only one complex pair, so
 grouped and interleaved names are numerically equivalent there. The correction,
 full-validation evidence, and historical-result boundary are documented in
 [`docs/v1_mobility_semantic_correction.md`](docs/v1_mobility_semantic_correction.md).
 
-These labels are enforced by the default `--semantic-profile official_lpan`; changing only a label cannot silently reinterpret the same raw columns. Use `--semantic-profile custom` only for a separately rearranged or regenerated dataset whose column meanings have been independently verified:
+These labels are enforced by the default `--semantic-profile v3_mobility_q0_q3`
+and contract version `mobility_q0_q3_v1`; changing only a label cannot silently
+reinterpret the same raw columns. Historical V1 runs remain readable with
+`--semantic-profile official_lpan --complex-layout interleaved --obs-times 1,4`.
+Use `custom` only for independently verified regenerated data.
 
 ```bash
 --obs-ris-indices 0,8,16,...,248
---complex-layout interleaved
---obs-times 1,4
+--complex-layout grouped
+--obs-times 0,3
 --semantic-profile custom
 ```
+
+The cancellation proof, old-checkpoint gate, validation-only re-evaluation,
+and formal baseline matrix are documented in
+[`docs/v3_canonical_baseline_protocol.md`](docs/v3_canonical_baseline_protocol.md).
+
+### Canonical V1 paper baselines
+
+Run the semantic gate before deciding whether LPAN/LPAN-L need retraining:
+
+```bash
+python main.py audit-v3-baseline-semantics \
+  --checkpoint-root /path/to/historical/v1/runs
+python main.py baseline-matrix --action plan \
+  --models lpan_progressive,lpan_l_progressive,edsr_lite,cnn_gru \
+  --seeds 123,456,789
+```
+
+The generated `launch_3gpu.sh` assigns seed 123/456/789 to GPU 0/1/2. Each
+worker runs its models serially. EDSR-lite and CNN-GRU always train under the
+canonical profile; LPAN variants train only when the six-gate audit returns
+`RERUN_REQUIRED`. GCN-GRU remains in the repository but is excluded from this
+formal matrix. These commands use TRAIN and VALIDATION only.
 
 ## Reproducing the experiments
 

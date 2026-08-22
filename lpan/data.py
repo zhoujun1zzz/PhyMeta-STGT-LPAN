@@ -28,8 +28,26 @@ SPECS = {
     # The two stored pilots are temporal anchors q1 and q4 in the frame.
     "mobility": DatasetSpec("mobility", 2, 6, 1, (1, 4)),
 }
-SEMANTIC_PROFILES = ("official_lpan", "custom")
+MOBILITY_BASELINE_CONTRACT_VERSION = "mobility_q0_q3_v1"
+CANONICAL_MOBILITY_PROFILE = "v3_mobility_q0_q3"
+LEGACY_MOBILITY_PROFILES = ("official_lpan", "legacy_v1")
+SEMANTIC_PROFILES = (
+    CANONICAL_MOBILITY_PROFILE,
+    *LEGACY_MOBILITY_PROFILES,
+    "custom",
+)
 OFFICIAL_COMPLEX_LAYOUT = {"quasi": "grouped", "mobility": "interleaved"}
+
+
+def profile_defaults(domain: str, profile: str) -> tuple[str, tuple[int, ...]]:
+    """Return the raw layout and observation labels locked by a profile."""
+    if domain not in SPECS:
+        raise ValueError(f"Unknown domain {domain!r}.")
+    if profile not in SEMANTIC_PROFILES:
+        raise ValueError(f"semantic_profile must be one of {SEMANTIC_PROFILES}.")
+    if domain == "mobility" and profile == CANONICAL_MOBILITY_PROFILE:
+        return "grouped", (0, 3)
+    return OFFICIAL_COMPLEX_LAYOUT[domain], SPECS[domain].obs_time_index
 
 
 def default_observed_ris_indices() -> tuple[int, ...]:
@@ -55,7 +73,7 @@ def validate_semantic_profile(
     if profile == "custom":
         return
     expected_ris = default_observed_ris_indices()
-    expected_times = SPECS[domain].obs_time_index
+    expected_layout, expected_times = profile_defaults(domain, profile)
     mismatches: dict[str, object] = {}
     if tuple(obs_ris_index) != expected_ris:
         mismatches["obs_ris_index"] = {
@@ -68,9 +86,7 @@ def validate_semantic_profile(
             "received": list(obs_time_index),
         }
     valid_layouts = (
-        {"grouped", "interleaved"}
-        if domain == "quasi"
-        else {OFFICIAL_COMPLEX_LAYOUT[domain]}
+        {"grouped", "interleaved"} if domain == "quasi" else {expected_layout}
     )
     if complex_layout not in valid_layouts:
         mismatches["complex_layout"] = {
@@ -79,8 +95,8 @@ def validate_semantic_profile(
         }
     if mismatches:
         raise ValueError(
-            "official_lpan semantic profile rejects labels that do not match "
-            f"the stored official columns: {mismatches}. Use profile='custom' "
+            f"{profile} semantic profile rejects labels that do not match "
+            f"its locked columns: {mismatches}. Use profile='custom' "
             "only for an independently rearranged or regenerated dataset."
         )
 
@@ -97,6 +113,11 @@ def semantic_contract(
     if domain not in SPECS:
         raise ValueError(f"Unknown domain {domain!r}.")
     contract = {
+        "contract_version": (
+            MOBILITY_BASELINE_CONTRACT_VERSION
+            if domain == "mobility" and semantic_profile == CANONICAL_MOBILITY_PROFILE
+            else "legacy_v1"
+        ),
         "domain": domain,
         "semantic_profile": semantic_profile,
         "complex_layout": complex_layout,
@@ -152,8 +173,9 @@ class LPANH5Dataset(Dataset):
         self.domain = domain
         self.split = split
         self.spec = SPECS[domain]
+        default_layout, default_times = profile_defaults(domain, semantic_profile)
         if complex_layout is None:
-            complex_layout = OFFICIAL_COMPLEX_LAYOUT[domain]
+            complex_layout = default_layout
         if complex_layout not in {"grouped", "interleaved"}:
             raise ValueError("complex_layout must be grouped or interleaved.")
         self.complex_layout = complex_layout
@@ -164,7 +186,7 @@ class LPANH5Dataset(Dataset):
             else (int(x) for x in obs_ris_index)
         )
         self.obs_time_index = tuple(
-            self.spec.obs_time_index
+            default_times
             if obs_time_index is None
             else (int(x) for x in obs_time_index)
         )
@@ -289,6 +311,10 @@ class LPANH5Dataset(Dataset):
             "obs_time_index": torch.tensor(self.obs_time_index, dtype=torch.long),
             "query_time": torch.arange(self.spec.query_blocks, dtype=torch.long),
             "domain_id": torch.tensor(self.spec.domain_id, dtype=torch.long),
+            "complex_layout_id": torch.tensor(
+                0 if self.complex_layout == "grouped" else 1,
+                dtype=torch.long,
+            ),
             "observation_mask": torch.ones(
                 self.spec.obs_blocks, len(self.obs_ris_index), dtype=torch.bool
             ),

@@ -361,6 +361,14 @@ def lpan_raw_input(obs: torch.Tensor) -> torch.Tensor:
     return obs.permute(0, 1, 4, 3, 2).reshape(b, 2 * t, m, n).contiguous()
 
 
+def lpan_grouped_raw_input(obs: torch.Tensor) -> torch.Tensor:
+    """Restore grouped MAT order [Re0,Re1,...,Im0,Im1,...]."""
+    if obs.ndim != 5 or obs.shape[-1] != 2:
+        raise ValueError("obs must have shape [B,T,N,M,2].")
+    b, t, n, m, _ = obs.shape
+    return obs.permute(0, 4, 1, 3, 2).reshape(b, 2 * t, m, n).contiguous()
+
+
 def lpan_raw_output(
     image: torch.Tensor, query_blocks: int
 ) -> torch.Tensor:
@@ -375,6 +383,37 @@ def lpan_raw_output(
         .permute(0, 1, 4, 3, 2)
         .contiguous()
     )
+
+
+def lpan_grouped_raw_output(
+    image: torch.Tensor, query_blocks: int
+) -> torch.Tensor:
+    """Decode grouped raw channels into [B,Q,N,M,2]."""
+    if image.ndim != 4 or image.shape[1] != 2 * query_blocks:
+        raise ValueError(
+            f"image must have shape [B,{2 * query_blocks},M,N]."
+        )
+    b, _, m, n = image.shape
+    return (
+        image.reshape(b, 2, query_blocks, m, n)
+        .permute(0, 2, 4, 3, 1)
+        .contiguous()
+    )
+
+
+def _batch_uses_grouped_layout(batch: Mapping[str, torch.Tensor]) -> bool:
+    """Resolve a homogeneous batch layout without adding model parameters."""
+    layout = batch.get("complex_layout_id")
+    if layout is None:
+        # Backwards compatibility for pre-profile callers and historical tests.
+        return False
+    values = layout.reshape(-1)
+    if values.numel() == 0 or not bool((values == values[0]).all()):
+        raise ValueError("Every item in a batch must use the same complex layout.")
+    value = int(values[0].item())
+    if value not in (0, 1):
+        raise ValueError("complex_layout_id must be 0 (grouped) or 1 (interleaved).")
+    return value == 0
 
 
 class LPANResidualBlock(nn.Module):
@@ -550,7 +589,10 @@ class ProgressiveLPAN(nn.Module):
             raise ValueError(
                 f"Expected {self.obs_blocks} observation blocks, got {obs.shape[1]}."
             )
-        previous = lpan_raw_input(obs)
+        grouped = _batch_uses_grouped_layout(batch)
+        previous = (
+            lpan_grouped_raw_input(obs) if grouped else lpan_raw_input(obs)
+        )
         features = self.head(previous)
         outputs: list[torch.Tensor] = []
         for feature_stage, reconstruction_stage in zip(
@@ -558,7 +600,11 @@ class ProgressiveLPAN(nn.Module):
         ):
             features = feature_stage(features)
             previous = reconstruction_stage(features, previous)
-            outputs.append(lpan_raw_output(previous, self.query_blocks))
+            outputs.append(
+                lpan_grouped_raw_output(previous, self.query_blocks)
+                if grouped
+                else lpan_raw_output(previous, self.query_blocks)
+            )
         return outputs[0], outputs[1], outputs[2]
 
     def forward(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -571,7 +617,8 @@ class ProgressiveLPAN(nn.Module):
             "source_repository": "WiCi-Lab/LPAN",
             "domain": self.domain,
             "feature_channels": 96,
-            "raw_channel_order": "interleaved_real_imag_per_time_block",
+            "raw_channel_order": "profile_selected_grouped_or_interleaved",
+            "semantic_adapter_parameters": 0,
         }
         if self.lightweight:
             metadata.update(

@@ -22,7 +22,12 @@ from lpan.complexity import (
     canonical_batch,
     profile_model_complexity,
 )
-from lpan.data import LPANH5Dataset, semantic_contract, semantic_fingerprint
+from lpan.data import (
+    CANONICAL_MOBILITY_PROFILE,
+    LPANH5Dataset,
+    semantic_contract,
+    semantic_fingerprint,
+)
 from lpan.engine import (
     capture_rng_state,
     configure_adaptation,
@@ -56,6 +61,17 @@ from lpan.studies import (
     hyperparameter_candidates,
 )
 from lpan.transfer import ADAPTATION_MODES, file_sha256
+from lpan.semantic_audit import (
+    evaluate_canonical_checkpoints,
+    run_semantic_audit,
+)
+from lpan.baseline_matrix import (
+    FORMAL_BASELINE_MODELS,
+    FORMAL_SEEDS,
+    build_baseline_plan,
+    run_worker,
+    write_plan_and_launcher,
+)
 
 
 PROJECT = Path(__file__).resolve().parent
@@ -84,21 +100,22 @@ def infer_semantic_profile(
     obs_ris_indices: object,
     complex_layout: object,
 ) -> str:
-    expected_times = (1, 4) if domain == "mobility" else (0,)
     try:
         times = tuple(obs_times)  # type: ignore[arg-type]
         indices = tuple(obs_ris_indices)  # type: ignore[arg-type]
     except TypeError:
         return "custom"
+    if indices != tuple(range(0, 256, 8)):
+        return "custom"
+    if domain == "mobility":
+        if times == (0, 3) and complex_layout == "grouped":
+            return CANONICAL_MOBILITY_PROFILE
+        if times == (1, 4) and complex_layout == "interleaved":
+            return "official_lpan"
+        return "custom"
     return (
         "official_lpan"
-        if times == expected_times
-        and indices == tuple(range(0, 256, 8))
-        and (
-            complex_layout == "interleaved"
-            if domain == "mobility"
-            else complex_layout in {"grouped", "interleaved"}
-        )
+        if times == (0,) and complex_layout in {"grouped", "interleaved"}
         else "custom"
     )
 
@@ -140,7 +157,7 @@ def make_loader(
     obs_times: tuple[int, ...] | None = None,
     obs_ris_indices: tuple[int, ...] | None = None,
     complex_layout: str | None = None,
-    semantic_profile: str = "official_lpan",
+    semantic_profile: str = CANONICAL_MOBILITY_PROFILE,
     shuffle: bool = False,
 ) -> DataLoader:
     dataset = LPANH5Dataset(
@@ -179,6 +196,75 @@ def seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def audit_v3_baseline_semantics_command(
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    result = run_semantic_audit(
+        path_for("mobility", "train", args.train_path, args.data_root),
+        path_for("mobility", "validation", args.val_path, args.data_root),
+        args.checkpoint_root,
+        count=args.audit_samples,
+    )
+    write_json(Path(args.output), result)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return result
+
+
+def evaluate_v3_baselines_command(args: argparse.Namespace) -> dict[str, object]:
+    result = evaluate_canonical_checkpoints(
+        args.checkpoint_root,
+        path_for("mobility", "validation", args.val_path, args.data_root),
+        project=PROJECT,
+        device=device_from(args.device),
+        batch_size=args.batch_size,
+        workers=args.workers,
+        models=args.models,
+        seeds=args.seeds,
+    )
+    write_json(Path(args.output), result)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return result
+
+
+def baseline_matrix_command(args: argparse.Namespace) -> dict[str, object]:
+    if args.action == "plan":
+        audit = {}
+        if args.audit_result and Path(args.audit_result).is_file():
+            value = json.loads(Path(args.audit_result).read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                audit = value
+        plan = build_baseline_plan(
+            args.models,
+            args.seeds,
+            audit=audit,
+            checkpoint_root=args.checkpoint_root,
+        )
+        write_plan_and_launcher(
+            plan,
+            plan_path=args.plan_file,
+            launcher_path=args.launcher,
+            output_root=args.output_root,
+            data_root=args.data_root,
+        )
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return plan
+    plan = json.loads(Path(args.plan_file).read_text(encoding="utf-8"))
+    rows = run_worker(
+        plan,
+        seed=args.seed,
+        device=args.device,
+        data_root=args.data_root,
+        output_root=args.output_root,
+        main_path=Path(__file__),
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        workers=args.workers,
+    )
+    result = {"seed": args.seed, "results": rows, "test_split_used": False}
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return result
 
 
 def model_config(args: argparse.Namespace, domain: str) -> dict[str, object]:
@@ -288,9 +374,8 @@ def audit_command(args: argparse.Namespace) -> None:
             "obs_ris_index": list(args.obs_ris_indices),
             "mobility_obs_time_index": list(args.mobility_obs_times),
             "pilot_time_note": (
-                "The stored pilots are temporal anchors q1 and q4 within the "
-                "six-block frame; unobserved queries include interpolation "
-                "and two-sided extrapolation."
+                "The formal canonical profile labels the two pilots q0 and q3; "
+                "q1/q2 are interpolation and q4/q5 are extrapolation."
             ),
         },
         "files": [],
@@ -316,7 +401,7 @@ def audit_command(args: argparse.Namespace) -> None:
                 "valid": False,
                 "attempted_paths": [str(candidate) for candidate in candidates],
             }
-            if args.semantic_profile == "official_lpan" and domain == "mobility":
+            if args.semantic_profile != "custom" and domain == "mobility":
                 entry["expected_total_samples"] = MOBILITY_EXPECTED_SAMPLES[split]
             if path.is_file():
                 try:
@@ -352,7 +437,7 @@ def audit_command(args: argparse.Namespace) -> None:
                     entry["total_samples_in_file"] = dataset.total_samples_in_file
                     dataset.close()
                     if (
-                        args.semantic_profile == "official_lpan"
+                        args.semantic_profile != "custom"
                         and domain == "mobility"
                     ):
                         expected = MOBILITY_EXPECTED_SAMPLES[split]
@@ -1096,6 +1181,11 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
             "improved": improved,
             "early_stopping_stale_epochs": stale_epochs,
             "epoch_seconds": time.perf_counter() - started,
+            "wall_clock_seconds": (
+                previous_adaptation_seconds
+                + time.perf_counter()
+                - adaptation_started
+            ),
         }
         for key, value in train_result.items():
             if key not in {"total", "nmse"}:
@@ -2793,15 +2883,21 @@ def add_data_semantics(
     parser.add_argument(
         "--complex-layout",
         choices=["grouped", "interleaved"],
-        default=None if optional else "interleaved",
+        default=None if optional else "grouped",
         help="Raw real/imag channel ordering in Yd and Hd.",
     )
     parser.add_argument(
         "--semantic-profile",
-        choices=["official_lpan", "custom"],
-        default=None if optional else "official_lpan",
+        choices=[
+            CANONICAL_MOBILITY_PROFILE,
+            "official_lpan",
+            "legacy_v1",
+            "custom",
+        ],
+        default=None if optional else CANONICAL_MOBILITY_PROFILE,
         help=(
-            "official_lpan locks the verified RIS/time/layout semantics; "
+            "v3_mobility_q0_q3 locks grouped q0/q3 formal semantics; "
+            "official_lpan/legacy_v1 preserve interleaved q1/q4 history; "
             "custom is only for independently rearranged datasets."
         ),
     )
@@ -2819,7 +2915,7 @@ def add_study_training_protocol(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     parser.add_argument("--train-path")
     parser.add_argument("--val-path")
-    parser.add_argument("--obs-times", type=ints, default=(1, 4))
+    parser.add_argument("--obs-times", type=ints, default=(0, 3))
     parser.add_argument("--fraction", type=float, default=1.0)
     parser.add_argument("--max-train", type=int)
     parser.add_argument("--max-val", type=int)
@@ -2857,8 +2953,62 @@ def parser() -> argparse.ArgumentParser:
     )
     commands = root.add_subparsers(dest="command", required=True)
 
+    semantic_audit = commands.add_parser("audit-v3-baseline-semantics")
+    semantic_audit.add_argument("--train-path")
+    semantic_audit.add_argument("--val-path")
+    semantic_audit.add_argument("--checkpoint-root", default="runs")
+    semantic_audit.add_argument("--audit-samples", type=int, default=64)
+    semantic_audit.add_argument(
+        "--output", default="runs/v3_baseline_semantic_audit.json"
+    )
+    add_data_root(semantic_audit)
+    semantic_audit.set_defaults(func=audit_v3_baseline_semantics_command)
+
+    canonical_evaluation = commands.add_parser("evaluate-v3-baselines")
+    canonical_evaluation.add_argument("--val-path")
+    canonical_evaluation.add_argument("--checkpoint-root", default="runs")
+    canonical_evaluation.add_argument(
+        "--models", type=strings, default=("lpan_progressive", "lpan_l_progressive")
+    )
+    canonical_evaluation.add_argument(
+        "--seeds", type=ints, default=(123, 456, 789)
+    )
+    canonical_evaluation.add_argument(
+        "--output", default="runs/v3_baseline_validation.json"
+    )
+    canonical_evaluation.add_argument("--batch-size", type=int, default=64)
+    canonical_evaluation.add_argument("--workers", type=int, default=0)
+    canonical_evaluation.add_argument("--device", default="auto")
+    add_data_root(canonical_evaluation)
+    canonical_evaluation.set_defaults(func=evaluate_v3_baselines_command)
+
+    baseline_matrix = commands.add_parser("baseline-matrix")
+    baseline_matrix.add_argument(
+        "--action", choices=["plan", "run-worker"], required=True
+    )
+    baseline_matrix.add_argument(
+        "--models", type=strings, default=FORMAL_BASELINE_MODELS
+    )
+    baseline_matrix.add_argument("--seeds", type=ints, default=FORMAL_SEEDS)
+    baseline_matrix.add_argument("--seed", type=int, default=123)
+    baseline_matrix.add_argument("--device", default="cuda")
+    baseline_matrix.add_argument("--epochs", type=int, default=100)
+    baseline_matrix.add_argument("--batch-size", type=int, default=32)
+    baseline_matrix.add_argument("--workers", type=int, default=8)
+    baseline_matrix.add_argument(
+        "--audit-result", default="runs/v3_baseline_semantic_audit.json"
+    )
+    baseline_matrix.add_argument("--checkpoint-root", default="runs")
+    baseline_matrix.add_argument(
+        "--plan-file", default="runs/baseline_matrix_plan.json"
+    )
+    baseline_matrix.add_argument("--launcher", default="launch_3gpu.sh")
+    baseline_matrix.add_argument("--output-root", default="runs/v3_formal_baselines")
+    add_data_root(baseline_matrix)
+    baseline_matrix.set_defaults(func=baseline_matrix_command)
+
     audit = commands.add_parser("audit")
-    audit.add_argument("--mobility-obs-times", type=ints, default=(1, 4))
+    audit.add_argument("--mobility-obs-times", type=ints, default=(0, 3))
     audit.add_argument(
         "--include-test",
         action="store_true",
@@ -2902,7 +3052,7 @@ def parser() -> argparse.ArgumentParser:
         "--domain", choices=["quasi", "mobility"], required=True
     )
     benchmark.add_argument("--train-path")
-    benchmark.add_argument("--obs-times", type=ints, default=(1, 4))
+    benchmark.add_argument("--obs-times", type=ints, default=(0, 3))
     benchmark.add_argument(
         "--candidates", type=ints, default=(16, 32, 64, 128)
     )
@@ -2940,7 +3090,7 @@ def parser() -> argparse.ArgumentParser:
     train.add_argument("--mode", choices=["smoke", "full"], default="smoke")
     train.add_argument("--train-path")
     train.add_argument("--val-path")
-    train.add_argument("--obs-times", type=ints, default=(1, 4))
+    train.add_argument("--obs-times", type=ints, default=(0, 3))
     train.add_argument("--fraction", type=float, default=1.0)
     train.add_argument("--max-train", type=int)
     train.add_argument("--max-val", type=int)
@@ -3016,7 +3166,7 @@ def parser() -> argparse.ArgumentParser:
     interpolation.add_argument("--domain", choices=["quasi", "mobility"], required=True)
     interpolation.add_argument("--split", choices=["validation", "test"], default="validation")
     interpolation.add_argument("--data-path")
-    interpolation.add_argument("--obs-times", type=ints, default=(1, 4))
+    interpolation.add_argument("--obs-times", type=ints, default=(0, 3))
     interpolation.add_argument("--spatial", choices=["linear", "nearest"], default="linear")
     interpolation.add_argument("--temporal", choices=["linear", "nearest"], default="linear")
     interpolation.add_argument("--max-samples", type=int)
@@ -3032,7 +3182,7 @@ def parser() -> argparse.ArgumentParser:
     ridge.add_argument("--train-path")
     ridge.add_argument("--val-path")
     ridge.add_argument("--test-path")
-    ridge.add_argument("--obs-times", type=ints, default=(1, 4))
+    ridge.add_argument("--obs-times", type=ints, default=(0, 3))
     ridge.add_argument("--lambdas", type=floats, default=(1e-6, 1e-4, 1e-2, 1.0))
     ridge.add_argument("--max-train", type=int)
     ridge.add_argument("--max-val", type=int)
@@ -3047,7 +3197,7 @@ def parser() -> argparse.ArgumentParser:
 
     joint = commands.add_parser("joint")
     joint.add_argument("--mode", choices=["smoke", "full"], default="smoke")
-    joint.add_argument("--obs-times", type=ints, default=(1, 4))
+    joint.add_argument("--obs-times", type=ints, default=(0, 3))
     joint.add_argument("--epochs", type=int, default=100)
     joint.add_argument("--steps-per-epoch", type=int)
     joint.add_argument("--eval-batch-size", type=int, default=64)
