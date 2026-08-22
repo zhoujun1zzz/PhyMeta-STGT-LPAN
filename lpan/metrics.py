@@ -51,10 +51,12 @@ class MetricAccumulator:
         self._require_finite("target_h", target)
         self._add("overall", sample_nmse(prediction, target))
         for block in range(target.shape[1]):
+            values = sample_nmse(prediction[:, block], target[:, block])
             self._add(
                 f"block_{block + 1}",
-                sample_nmse(prediction[:, block], target[:, block]),
+                values,
             )
+            self._add(f"q{block}", values)
         ris = batch["obs_ris_index"][0] if batch["obs_ris_index"].ndim == 2 else batch["obs_ris_index"]
         self._add(
             "observed_ris",
@@ -90,6 +92,21 @@ class MetricAccumulator:
                     target.index_select(1, nonpilot),
                 ),
             )
+        if target.shape[1] == 6 and tuple(int(v) for v in times.tolist()) == (0, 3):
+            for key, indices in {
+                "anchor_q0_q3": (0, 3),
+                "nonpilot_q1_q2_q4_q5": (1, 2, 4, 5),
+                "interpolation_q1_q2": (1, 2),
+                "extrapolation_q4_q5": (4, 5),
+            }.items():
+                selected = torch.tensor(indices, device=target.device)
+                self._add(
+                    key,
+                    sample_nmse(
+                        prediction.index_select(1, selected),
+                        target.index_select(1, selected),
+                    ),
+                )
 
     def compute(self) -> dict[str, float | int | dict[str, float]]:
         linear = {

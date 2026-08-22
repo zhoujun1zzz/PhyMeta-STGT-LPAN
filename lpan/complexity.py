@@ -57,7 +57,7 @@ def canonical_batch(
             0, 256, 8, dtype=torch.long, device=target_device
         ).unsqueeze(0).expand(batch_size, -1),
         "obs_time_index": torch.tensor(
-            [0] if domain == "quasi" else [1, 4],
+            [0] if domain == "quasi" else [0, 3],
             dtype=torch.long,
             device=target_device,
         ).unsqueeze(0).expand(batch_size, -1),
@@ -66,6 +66,9 @@ def canonical_batch(
         ).unsqueeze(0).expand(batch_size, -1),
         "domain_id": torch.full(
             (batch_size,), domain_id, dtype=torch.long, device=target_device
+        ),
+        "complex_layout_id": torch.zeros(
+            batch_size, dtype=torch.long, device=target_device
         ),
         "observation_mask": torch.ones(
             batch_size,
